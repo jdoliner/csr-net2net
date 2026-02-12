@@ -71,6 +71,31 @@ class TrainConfig:
         """
         return self.width_schedule[1:]
 
+    @property
+    def stage_boundaries(self) -> list[int]:
+        """Return the starting epoch of each stage (including 0 for the first).
+
+        E.g., with epochs_per_stage=[30, 30, 30, 60], returns [0, 30, 60, 90].
+        """
+        boundaries = [0]
+        cumulative = 0
+        for stage_epochs in self.epochs_per_stage[:-1]:
+            cumulative += stage_epochs
+            boundaries.append(cumulative)
+        return boundaries
+
+    def stage_length_at(self, epoch: int) -> int:
+        """Return the number of epochs in the stage that contains the given epoch.
+
+        Used to set T_max for cosine annealing within each stage.
+        """
+        cumulative = 0
+        for stage_epochs in self.epochs_per_stage:
+            cumulative += stage_epochs
+            if epoch < cumulative:
+                return stage_epochs
+        return self.epochs_per_stage[-1]
+
 
 @dataclass
 class ExpansionEvent:
@@ -178,6 +203,16 @@ def train_protocol(
         model.parameters(), lr=config.lr, weight_decay=config.weight_decay
     )
 
+    # Cosine annealing LR scheduler — reset at each expansion.
+    # For scratch: anneal over all epochs. For expansion protocols: anneal per stage.
+    if protocol == "scratch":
+        scheduler_T = total_epochs
+    else:
+        scheduler_T = config.epochs_per_stage[0]
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=scheduler_T, eta_min=1e-6
+    )
+
     global_step = 0
     expansion_events: list[ExpansionEvent] = []
 
@@ -231,6 +266,17 @@ def train_protocol(
 
             writer.add_scalar(f"{tag_prefix}/Val_Loss_PreExpand", val_loss_before, global_step)
             writer.add_scalar(f"{tag_prefix}/Val_Loss_PostExpand_Immediate", val_loss_immediate, global_step)
+
+            # Reset LR and scheduler for the new stage
+            for pg in optimizer.param_groups:
+                pg["lr"] = config.lr
+            stage_epochs = config.stage_length_at(epoch)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=stage_epochs, eta_min=1e-6
+            )
+            logger.info(
+                f"[{tag_prefix}] LR scheduler reset: T_max={stage_epochs}, lr={config.lr}"
+            )
 
             # Remember that we need to measure shock after the next epoch
             pending_shock = {
@@ -290,10 +336,16 @@ def train_protocol(
         writer.add_scalar(f"{tag_prefix}/Accuracy/Train", train_acc, global_step)
         writer.add_scalar(f"{tag_prefix}/Accuracy/Val", val_acc, global_step)
 
+        # Step LR scheduler and log
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]["lr"]
+        writer.add_scalar(f"{tag_prefix}/LR", current_lr, global_step)
+
         logger.info(
             f"[{tag_prefix}] Epoch {epoch+1}/{total_epochs} | "
             f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
-            f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
+            f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} | "
+            f"lr={current_lr:.6f}"
         )
 
         # --- Measure shock after first post-expansion epoch ---
