@@ -127,6 +127,7 @@ class TestSpectralSort:
 class TestPermuteLayerNeurons:
     def test_permutation_preserves_function(self, tiny_model, device):
         """Permuting neurons should not change the model's output."""
+        tiny_model.eval()  # Disable dropout for deterministic comparison
         x = torch.randn(4, TEST_INPUT_DIM, device=device)
         out_before = tiny_model(x).clone()
 
@@ -141,6 +142,7 @@ class TestPermuteLayerNeurons:
 
     def test_permutation_preserves_function_layer2(self, tiny_model, device):
         """Permuting layer 2 neurons should not change model output."""
+        tiny_model.eval()  # Disable dropout for deterministic comparison
         x = torch.randn(4, TEST_INPUT_DIM, device=device)
         out_before = tiny_model(x).clone()
 
@@ -246,11 +248,13 @@ class TestNet2NetExpansion:
 
     def test_function_preserving_no_noise(self, tiny_model, device):
         """Without noise, Net2Net should be exactly function-preserving."""
+        tiny_model.eval()  # Disable dropout for deterministic comparison
         optimizer = torch.optim.AdamW(tiny_model.parameters(), lr=1e-3)
         x = torch.randn(8, TEST_INPUT_DIM, device=device)
         out_before = tiny_model(x).clone()
 
         new_model = expand_model_net2net(tiny_model, 32, 32, optimizer, noise_std=0.0)
+        new_model.eval()
         out_after = new_model(x)
 
         assert torch.allclose(out_before, out_after, atol=1e-4), (

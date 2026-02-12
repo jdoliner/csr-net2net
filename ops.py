@@ -222,7 +222,12 @@ def expand_model_continuous(
     old_h2 = model.fc2.out_features
 
     input_dim = model.fc1.in_features
-    new_model = MLP(input_dim=input_dim, hidden1=new_hidden1, hidden2=new_hidden2).to(device)
+    new_model = MLP(
+        input_dim=input_dim,
+        hidden1=new_hidden1,
+        hidden2=new_hidden2,
+        dropout=model.dropout_rate,
+    ).to(device)
 
     with torch.no_grad():
         # --- Layer 1 (fc1): resample rows from old_h1 -> new_hidden1 ---
@@ -350,7 +355,12 @@ def expand_model_net2net(
     assert new_hidden2 == 2 * old_h2, "Net2Net expects exact 2x expansion"
 
     input_dim = model.fc1.in_features
-    new_model = MLP(input_dim=input_dim, hidden1=new_hidden1, hidden2=new_hidden2).to(device)
+    new_model = MLP(
+        input_dim=input_dim,
+        hidden1=new_hidden1,
+        hidden2=new_hidden2,
+        dropout=model.dropout_rate,
+    ).to(device)
 
     with torch.no_grad():
         # --- Expand hidden layer 1 ---

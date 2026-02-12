@@ -61,14 +61,15 @@ def main():
         "--width-schedule",
         type=int,
         nargs="+",
-        default=[128, 256, 512, 1024],
+        default=[128, 256, 512, 1024, 2048],
         help="Hidden widths for each stage (first is initial, rest are expansion targets)",
     )
+    parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument(
         "--epochs-per-stage",
         type=int,
         nargs="+",
-        default=[20, 20, 20, 40],
+        default=[30, 30, 30, 30, 60],
         help="Number of epochs for each stage (must match length of width-schedule)",
     )
     parser.add_argument(
@@ -102,6 +103,7 @@ def main():
         batch_size=args.batch_size,
         seed=args.seed,
         input_dim=args.input_dim,
+        dropout=args.dropout,
         width_schedule=args.width_schedule,
         epochs_per_stage=args.epochs_per_stage,
         device=args.device,

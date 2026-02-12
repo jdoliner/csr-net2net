@@ -33,8 +33,9 @@ class TrainConfig:
     batch_size: int = 256
     seed: int = 42
     input_dim: int = 3072
-    width_schedule: list[int] = field(default_factory=lambda: [128, 256, 512, 1024])
-    epochs_per_stage: list[int] = field(default_factory=lambda: [20, 20, 20, 40])
+    dropout: float = 0.2
+    width_schedule: list[int] = field(default_factory=lambda: [128, 256, 512, 1024, 2048])
+    epochs_per_stage: list[int] = field(default_factory=lambda: [30, 30, 30, 30, 60])
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     @property
@@ -155,6 +156,7 @@ def train_protocol(
             input_dim=config.input_dim,
             hidden1=config.final_width,
             hidden2=config.final_width,
+            dropout=config.dropout,
         ).to(device)
         expansion_schedule = {}  # No expansions
     else:
@@ -162,6 +164,7 @@ def train_protocol(
             input_dim=config.input_dim,
             hidden1=config.initial_width,
             hidden2=config.initial_width,
+            dropout=config.dropout,
         ).to(device)
         # Map epoch -> (target_width, expansion_index)
         expansion_schedule = {
