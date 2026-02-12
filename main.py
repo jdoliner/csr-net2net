@@ -2,7 +2,7 @@
 
 Usage:
     uv run python main.py
-    uv run python main.py --epochs-pre 5 --epochs-total 15  # Quick test
+    uv run python main.py --width-schedule 128 256 512 --epochs-per-stage 10 10 20
 """
 
 import argparse
@@ -55,12 +55,22 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--epochs-pre", type=int, default=30)
-    parser.add_argument("--epochs-total", type=int, default=60)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--input-dim", type=int, default=3072)
-    parser.add_argument("--hidden-small", type=int, default=256)
-    parser.add_argument("--hidden-large", type=int, default=512)
+    parser.add_argument(
+        "--width-schedule",
+        type=int,
+        nargs="+",
+        default=[128, 256, 512, 1024],
+        help="Hidden widths for each stage (first is initial, rest are expansion targets)",
+    )
+    parser.add_argument(
+        "--epochs-per-stage",
+        type=int,
+        nargs="+",
+        default=[20, 20, 20, 40],
+        help="Number of epochs for each stage (must match length of width-schedule)",
+    )
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -74,6 +84,11 @@ def main():
     )
     args = parser.parse_args()
 
+    assert len(args.width_schedule) == len(args.epochs_per_stage), (
+        f"width-schedule ({len(args.width_schedule)}) and epochs-per-stage "
+        f"({len(args.epochs_per_stage)}) must have the same length"
+    )
+
     # Setup logging
     logging.basicConfig(
         level=logging.INFO,
@@ -85,17 +100,18 @@ def main():
         lr=args.lr,
         weight_decay=args.weight_decay,
         batch_size=args.batch_size,
-        epochs_pre=args.epochs_pre,
-        epochs_total=args.epochs_total,
         seed=args.seed,
         input_dim=args.input_dim,
-        hidden_small=args.hidden_small,
-        hidden_large=args.hidden_large,
+        width_schedule=args.width_schedule,
+        epochs_per_stage=args.epochs_per_stage,
         device=args.device,
     )
 
     logger.info(f"Config: {config}")
     logger.info(f"Device: {config.device}")
+    schedule_str = " -> ".join(str(w) for w in config.width_schedule)
+    logger.info(f"Width schedule: {schedule_str}")
+    logger.info(f"Epochs per stage: {config.epochs_per_stage} (total: {config.total_epochs})")
 
     # Load data once, shared across all protocols
     train_loader, val_loader = load_cifar10(config.batch_size)
@@ -151,6 +167,9 @@ def main():
     logger.info(f"\n{'='*60}")
     logger.info("EXPERIMENT SUMMARY")
     logger.info(f"{'='*60}")
+    logger.info(f"  Schedule: {schedule_str}")
+    logger.info(f"  Epochs per stage: {config.epochs_per_stage}")
+    logger.info("")
 
     for name, results in all_results.items():
         tag = protocol_configs[name][1]
@@ -159,11 +178,10 @@ def main():
             f"val_loss={results['final_val_loss']:.4f}  "
             f"time={results['elapsed_time']:.1f}s"
         )
-        if results["expansion_event"] is not None:
-            ev = results["expansion_event"]
+        for ev in results["expansion_events"]:
             logger.info(
-                f"{'':>12s}  expansion_shock={ev.shock:+.4f}  "
-                f"acc_delta={ev.acc_after_first_epoch - ev.acc_before:+.4f}"
+                f"{'':>12s}  expand {ev.width_before}->{ev.width_after}: "
+                f"shock={ev.shock:+.4f}  acc_delta={ev.acc_delta:+.4f}"
             )
 
     writer.close()
