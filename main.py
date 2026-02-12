@@ -21,16 +21,17 @@ from train import TrainConfig, train_protocol
 logger = logging.getLogger(__name__)
 
 
-def load_mnist(batch_size: int) -> tuple[DataLoader, DataLoader]:
-    """Load MNIST using HuggingFace datasets, return train/val DataLoaders."""
-    logger.info("Loading MNIST dataset...")
-    ds = load_dataset("mnist")
+def load_cifar10(batch_size: int) -> tuple[DataLoader, DataLoader]:
+    """Load CIFAR-10 using HuggingFace datasets, return train/val DataLoaders."""
+    logger.info("Loading CIFAR-10 dataset...")
+    ds = load_dataset("cifar10")
 
     def to_tensors(split) -> TensorDataset:
         import numpy as np
 
-        # HuggingFace MNIST images are PIL Images — convert to numpy first
-        images_np = np.array([np.array(img) for img in split["image"]])
+        # CIFAR-10 images are 32x32x3 PIL Images
+        images_np = np.array([np.array(img) for img in split["img"]])
+        # Normalize to [0, 1] and flatten to [N, 3072]
         images = torch.tensor(images_np, dtype=torch.float32) / 255.0
         labels = torch.tensor(split["label"], dtype=torch.long)
         return TensorDataset(images, labels)
@@ -54,11 +55,12 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--epochs-pre", type=int, default=10)
-    parser.add_argument("--epochs-total", type=int, default=30)
+    parser.add_argument("--epochs-pre", type=int, default=30)
+    parser.add_argument("--epochs-total", type=int, default=60)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--hidden-small", type=int, default=128)
-    parser.add_argument("--hidden-large", type=int, default=256)
+    parser.add_argument("--input-dim", type=int, default=3072)
+    parser.add_argument("--hidden-small", type=int, default=256)
+    parser.add_argument("--hidden-large", type=int, default=512)
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -86,6 +88,7 @@ def main():
         epochs_pre=args.epochs_pre,
         epochs_total=args.epochs_total,
         seed=args.seed,
+        input_dim=args.input_dim,
         hidden_small=args.hidden_small,
         hidden_large=args.hidden_large,
         device=args.device,
@@ -95,7 +98,7 @@ def main():
     logger.info(f"Device: {config.device}")
 
     # Load data once, shared across all protocols
-    train_loader, val_loader = load_mnist(config.batch_size)
+    train_loader, val_loader = load_cifar10(config.batch_size)
 
     # TensorBoard setup
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -160,7 +163,7 @@ def main():
             ev = results["expansion_event"]
             logger.info(
                 f"{'':>12s}  expansion_shock={ev.shock:+.4f}  "
-                f"acc_delta={ev.acc_after - ev.acc_before:+.4f}"
+                f"acc_delta={ev.acc_after_first_epoch - ev.acc_before:+.4f}"
             )
 
     writer.close()

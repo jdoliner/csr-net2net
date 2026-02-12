@@ -25,6 +25,9 @@ from ops import (
     spectral_sort,
 )
 
+# Use a small input dim for fast tests
+TEST_INPUT_DIM = 64
+
 
 @pytest.fixture
 def device():
@@ -34,14 +37,14 @@ def device():
 @pytest.fixture
 def small_model(device):
     torch.manual_seed(42)
-    return MLP(hidden1=128, hidden2=128).to(device)
+    return MLP(input_dim=TEST_INPUT_DIM, hidden1=128, hidden2=128).to(device)
 
 
 @pytest.fixture
 def tiny_model(device):
     """Smaller model for faster tests."""
     torch.manual_seed(42)
-    return MLP(hidden1=16, hidden2=16).to(device)
+    return MLP(input_dim=TEST_INPUT_DIM, hidden1=16, hidden2=16).to(device)
 
 
 # --- Test cosine similarity matrix ---
@@ -124,7 +127,7 @@ class TestSpectralSort:
 class TestPermuteLayerNeurons:
     def test_permutation_preserves_function(self, tiny_model, device):
         """Permuting neurons should not change the model's output."""
-        x = torch.randn(4, 784, device=device)
+        x = torch.randn(4, TEST_INPUT_DIM, device=device)
         out_before = tiny_model(x).clone()
 
         # Create a random permutation and apply to layer 0
@@ -138,7 +141,7 @@ class TestPermuteLayerNeurons:
 
     def test_permutation_preserves_function_layer2(self, tiny_model, device):
         """Permuting layer 2 neurons should not change model output."""
-        x = torch.randn(4, 784, device=device)
+        x = torch.randn(4, TEST_INPUT_DIM, device=device)
         out_before = tiny_model(x).clone()
 
         perm = torch.randperm(16)
@@ -152,7 +155,7 @@ class TestPermuteLayerNeurons:
         optimizer = torch.optim.AdamW(tiny_model.parameters(), lr=1e-3)
 
         # Do a forward/backward to populate optimizer state
-        x = torch.randn(4, 784, device=device)
+        x = torch.randn(4, TEST_INPUT_DIM, device=device)
         loss = tiny_model(x).sum()
         loss.backward()
         optimizer.step()
@@ -233,7 +236,7 @@ class TestNet2NetExpansion:
     def test_output_shape(self, tiny_model, device):
         optimizer = torch.optim.AdamW(tiny_model.parameters(), lr=1e-3)
         # Populate optimizer state
-        x = torch.randn(4, 784, device=device)
+        x = torch.randn(4, TEST_INPUT_DIM, device=device)
         loss = tiny_model(x).sum()
         loss.backward()
         optimizer.step()
@@ -244,7 +247,7 @@ class TestNet2NetExpansion:
     def test_function_preserving_no_noise(self, tiny_model, device):
         """Without noise, Net2Net should be exactly function-preserving."""
         optimizer = torch.optim.AdamW(tiny_model.parameters(), lr=1e-3)
-        x = torch.randn(8, 784, device=device)
+        x = torch.randn(8, TEST_INPUT_DIM, device=device)
         out_before = tiny_model(x).clone()
 
         new_model = expand_model_net2net(tiny_model, 32, 32, optimizer, noise_std=0.0)
@@ -257,7 +260,7 @@ class TestNet2NetExpansion:
     def test_function_approximately_preserving_with_noise(self, tiny_model, device):
         """With small noise, outputs should be close."""
         optimizer = torch.optim.AdamW(tiny_model.parameters(), lr=1e-3)
-        x = torch.randn(8, 784, device=device)
+        x = torch.randn(8, TEST_INPUT_DIM, device=device)
         out_before = tiny_model(x).clone()
 
         new_model = expand_model_net2net(tiny_model, 32, 32, optimizer, noise_std=1e-3)
@@ -269,7 +272,7 @@ class TestNet2NetExpansion:
 
     def test_optimizer_state_has_correct_shapes(self, tiny_model, device):
         optimizer = torch.optim.AdamW(tiny_model.parameters(), lr=1e-3)
-        x = torch.randn(4, 784, device=device)
+        x = torch.randn(4, TEST_INPUT_DIM, device=device)
         loss = tiny_model(x).sum()
         loss.backward()
         optimizer.step()
@@ -293,7 +296,7 @@ class TestNet2NetExpansion:
 class TestCSRExpansion:
     def test_output_shape(self, tiny_model, device):
         optimizer = torch.optim.AdamW(tiny_model.parameters(), lr=1e-3)
-        x = torch.randn(4, 784, device=device)
+        x = torch.randn(4, TEST_INPUT_DIM, device=device)
         loss = tiny_model(x).sum()
         loss.backward()
         optimizer.step()
@@ -304,14 +307,14 @@ class TestCSRExpansion:
     def test_output_dimensions(self, tiny_model, device):
         """Verify all weight matrices have correct dimensions after expansion."""
         optimizer = torch.optim.AdamW(tiny_model.parameters(), lr=1e-3)
-        x = torch.randn(4, 784, device=device)
+        x = torch.randn(4, TEST_INPUT_DIM, device=device)
         loss = tiny_model(x).sum()
         loss.backward()
         optimizer.step()
 
         new_model = expand_model_continuous(tiny_model, 32, 32, optimizer)
 
-        assert new_model.fc1.weight.shape == (32, 784)
+        assert new_model.fc1.weight.shape == (32, TEST_INPUT_DIM)
         assert new_model.fc1.bias.shape == (32,)
         assert new_model.fc2.weight.shape == (32, 32)
         assert new_model.fc2.bias.shape == (32,)
@@ -320,7 +323,7 @@ class TestCSRExpansion:
 
     def test_optimizer_state_has_correct_shapes(self, tiny_model, device):
         optimizer = torch.optim.AdamW(tiny_model.parameters(), lr=1e-3)
-        x = torch.randn(4, 784, device=device)
+        x = torch.randn(4, TEST_INPUT_DIM, device=device)
         loss = tiny_model(x).sum()
         loss.backward()
         optimizer.step()
@@ -345,7 +348,7 @@ class TestCSRExpansion:
         """
         torch.manual_seed(42)
         optimizer = torch.optim.AdamW(tiny_model.parameters(), lr=1e-3)
-        x = torch.randn(32, 784, device=device)
+        x = torch.randn(32, TEST_INPUT_DIM, device=device)
 
         # Get pre-activation values from original model
         with torch.no_grad():
@@ -377,7 +380,7 @@ class TestCSRExpansion:
     def test_model_can_train_after_expansion(self, tiny_model, device):
         """Verify the expanded model can do forward/backward/step without errors."""
         optimizer = torch.optim.AdamW(tiny_model.parameters(), lr=1e-3)
-        x = torch.randn(4, 784, device=device)
+        x = torch.randn(4, TEST_INPUT_DIM, device=device)
 
         # Populate optimizer state
         loss = tiny_model(x).sum()
@@ -397,7 +400,7 @@ class TestCSRExpansion:
     def test_fc3_bias_preserved(self, tiny_model, device):
         """The output layer bias should be exactly preserved (no resampling)."""
         optimizer = torch.optim.AdamW(tiny_model.parameters(), lr=1e-3)
-        x = torch.randn(4, 784, device=device)
+        x = torch.randn(4, TEST_INPUT_DIM, device=device)
         loss = tiny_model(x).sum()
         loss.backward()
         optimizer.step()
@@ -413,7 +416,7 @@ class TestCSRExpansion:
 class TestNet2NetTrainability:
     def test_model_can_train_after_expansion(self, tiny_model, device):
         optimizer = torch.optim.AdamW(tiny_model.parameters(), lr=1e-3)
-        x = torch.randn(4, 784, device=device)
+        x = torch.randn(4, TEST_INPUT_DIM, device=device)
         loss = tiny_model(x).sum()
         loss.backward()
         optimizer.step()

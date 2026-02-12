@@ -24,28 +24,35 @@ class TrainConfig:
     lr: float = 1e-3
     weight_decay: float = 1e-4
     batch_size: int = 256
-    epochs_pre: int = 10
-    epochs_total: int = 30
+    epochs_pre: int = 30
+    epochs_total: int = 60
     seed: int = 42
-    hidden_small: int = 128
-    hidden_large: int = 256
+    input_dim: int = 3072
+    hidden_small: int = 256
+    hidden_large: int = 512
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 @dataclass
 class ExpansionEvent:
-    """Records what happened at expansion time."""
+    """Records what happened at expansion time.
+
+    Shock is measured as the difference between the pre-expansion val loss
+    and the val loss after the first post-expansion training epoch. This
+    captures how quickly each method converts new capacity into learning
+    progress, rather than penalizing methods that aren't function-preserving.
+    """
 
     step: int
     epoch: int
     loss_before: float
-    loss_after: float
+    loss_after_first_epoch: float
     acc_before: float
-    acc_after: float
+    acc_after_first_epoch: float
 
     @property
     def shock(self) -> float:
-        return self.loss_after - self.loss_before
+        return self.loss_after_first_epoch - self.loss_before
 
 
 def evaluate(
@@ -100,11 +107,19 @@ def train_protocol(
 
     # Initialize model
     if protocol == "scratch":
-        model = MLP(hidden1=config.hidden_large, hidden2=config.hidden_large).to(device)
+        model = MLP(
+            input_dim=config.input_dim,
+            hidden1=config.hidden_large,
+            hidden2=config.hidden_large,
+        ).to(device)
         total_epochs = config.epochs_total
         expand_at_epoch = None
     else:
-        model = MLP(hidden1=config.hidden_small, hidden2=config.hidden_small).to(device)
+        model = MLP(
+            input_dim=config.input_dim,
+            hidden1=config.hidden_small,
+            hidden2=config.hidden_small,
+        ).to(device)
         total_epochs = config.epochs_total
         expand_at_epoch = config.epochs_pre
 
@@ -114,6 +129,11 @@ def train_protocol(
 
     global_step = 0
     expansion_event = None
+    # Track pre-expansion loss for shock measurement after first post-expansion epoch
+    pre_expansion_loss = None
+    pre_expansion_acc = None
+    expansion_step = None
+    first_post_expansion_epoch = False
 
     logger.info(
         f"[{tag_prefix}] Starting training: {protocol} | "
@@ -128,6 +148,9 @@ def train_protocol(
 
             # Evaluate before expansion
             val_loss_before, val_acc_before = evaluate(model, val_loader, criterion, device)
+            pre_expansion_loss = val_loss_before
+            pre_expansion_acc = val_acc_before
+            expansion_step = global_step
             logger.info(
                 f"[{tag_prefix}] Pre-expansion: val_loss={val_loss_before:.4f}, "
                 f"val_acc={val_acc_before:.4f}"
@@ -143,32 +166,19 @@ def train_protocol(
                     model, config.hidden_large, config.hidden_large, optimizer
                 )
 
-            # Evaluate after expansion
-            val_loss_after, val_acc_after = evaluate(model, val_loader, criterion, device)
+            # Evaluate immediately after expansion (for TensorBoard, not shock metric)
+            val_loss_immediate, val_acc_immediate = evaluate(model, val_loader, criterion, device)
             logger.info(
-                f"[{tag_prefix}] Post-expansion: val_loss={val_loss_after:.4f}, "
-                f"val_acc={val_acc_after:.4f}"
+                f"[{tag_prefix}] Immediate post-expansion: val_loss={val_loss_immediate:.4f}, "
+                f"val_acc={val_acc_immediate:.4f}"
             )
 
-            expansion_event = ExpansionEvent(
-                step=global_step,
-                epoch=epoch,
-                loss_before=val_loss_before,
-                loss_after=val_loss_after,
-                acc_before=val_acc_before,
-                acc_after=val_acc_after,
-            )
-
-            writer.add_scalar(f"{tag_prefix}/Expansion_Shock", expansion_event.shock, global_step)
             writer.add_scalar(f"{tag_prefix}/Val_Loss_PreExpand", val_loss_before, global_step)
-            writer.add_scalar(f"{tag_prefix}/Val_Loss_PostExpand", val_loss_after, global_step)
+            writer.add_scalar(f"{tag_prefix}/Val_Loss_PostExpand_Immediate", val_loss_immediate, global_step)
             writer.add_scalar(f"{tag_prefix}/Val_Acc_PreExpand", val_acc_before, global_step)
-            writer.add_scalar(f"{tag_prefix}/Val_Acc_PostExpand", val_acc_after, global_step)
+            writer.add_scalar(f"{tag_prefix}/Val_Acc_PostExpand_Immediate", val_acc_immediate, global_step)
 
-            logger.info(
-                f"[{tag_prefix}] Expansion shock: {expansion_event.shock:+.4f} "
-                f"(loss delta), acc delta: {val_acc_after - val_acc_before:+.4f}"
-            )
+            first_post_expansion_epoch = True
 
         # --- Training epoch ---
         model.train()
@@ -225,6 +235,28 @@ def train_protocol(
             f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
             f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
         )
+
+        # --- Measure shock after first post-expansion epoch ---
+        if first_post_expansion_epoch:
+            first_post_expansion_epoch = False
+            expansion_event = ExpansionEvent(
+                step=expansion_step,
+                epoch=epoch,
+                loss_before=pre_expansion_loss,
+                loss_after_first_epoch=val_loss,
+                acc_before=pre_expansion_acc,
+                acc_after_first_epoch=val_acc,
+            )
+
+            writer.add_scalar(f"{tag_prefix}/Expansion_Shock", expansion_event.shock, expansion_step)
+            writer.add_scalar(f"{tag_prefix}/Val_Loss_PostExpand_1Epoch", val_loss, expansion_step)
+            writer.add_scalar(f"{tag_prefix}/Val_Acc_PostExpand_1Epoch", val_acc, expansion_step)
+
+            logger.info(
+                f"[{tag_prefix}] Post-expansion shock (after 1 epoch): "
+                f"loss_delta={expansion_event.shock:+.4f}, "
+                f"acc_delta={val_acc - pre_expansion_acc:+.4f}"
+            )
 
     # Final evaluation
     final_val_loss, final_val_acc = evaluate(model, val_loader, criterion, device)
