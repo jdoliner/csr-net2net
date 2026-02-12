@@ -35,7 +35,7 @@ class TrainConfig:
     input_dim: int = 3072
     dropout: float = 0.2
     width_schedule: list[int] = field(default_factory=lambda: [128, 256, 512, 1024, 2048])
-    epochs_per_stage: list[int] = field(default_factory=lambda: [30, 30, 30, 30, 60])
+    epochs_per_stage: list[int] = field(default_factory=lambda: [15, 15, 15, 15, 30])
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     @property

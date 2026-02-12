@@ -69,7 +69,7 @@ def main():
         "--epochs-per-stage",
         type=int,
         nargs="+",
-        default=[30, 30, 30, 30, 60],
+        default=[15, 15, 15, 15, 30],
         help="Number of epochs for each stage (must match length of width-schedule)",
     )
     parser.add_argument(
