@@ -5,7 +5,7 @@ back on anything that doesn't make sense.
 # Research Spec: Continuous Signal Resampling for Network Scaling
 
 **Target Hardware:** Single H100 Node
-**Framework:** PyTorch
+**Framework:** PyTorch, uv for dependency management
 **Logging:** TensorBoard
 
 ## 1. Abstract & Objective
@@ -80,8 +80,6 @@ Treat the sorted weights as a signal sampled at  points and resample to .
 Because we have doubled the number of inputs to the next layer ( neurons), the pre-activation sum will double if weights are unchanged.
 
 * **Adjustment:** Scale the *outgoing* weights () by a factor of .
-
-
 
 ---
 
@@ -164,6 +162,10 @@ We need high-resolution logging around the expansion event.
 
 * `train.py`: Standard loop.
 
+### 5.4 Logging
+
+In addition to TensorBoard we should have some basic logging to the console. This should include a progress bar using tqdm that also shows loss and printing out metrics at the end of each epoch. Especially important are metrics after scale up.
+
 ---
 
 ## 6. Success Metrics
@@ -178,8 +180,11 @@ The experiment is a success if **Experiment C** demonstrates:
 
 ## 7. Clarifications & Open Questions
 
+* **When to expand:** One interesting question is when we should expand the network. We should start by doing it at a fixed interval, but we'd also like to try doing it when loss reaches a certain threshold. This allows us to exploit the advantage of the "ant's eye view" and expand when we are in a "valley" of the loss landscape, which should make the transition smoother.
 * **Layer Depth:** This spec assumes we only scale width. Scaling depth (inserting layers) is a separate algebraic problem (Identity initialization) and is out of scope for this specific test.
 * **Activation Functions:** We assume ReLU. If using GeLU or Swish, the scaling factor () generally remains correct for linear regimes, but variance analysis might suggest slight tweaks. We will stick to  for simplicity.
 * **Optimizer State:** When expanding, we handle the Adam optimizer state (momentum  and variance ) by resampling and exactly using the same interpolation method as the weights. This allows the "momentum" of the "ant" to be preserved across the manifold transformation.
 
 Read this spec thoroughly, ask for any clarifications and use your expertise to push back on anything that doesn't make sense.
+
+Once we agree on the design we'll move on to implementation. I have already setup an empty uv environment with PyTorch, TensorBoard and datasets dependencies installed. Install anything else you need.
