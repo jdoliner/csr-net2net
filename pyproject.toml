@@ -1,0 +1,7 @@
+[project]
+name = "csr-net2net"
+version = "0.1.0"
+description = "Continuous Signal Resampling for Network Scaling"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
