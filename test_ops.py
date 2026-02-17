@@ -17,8 +17,12 @@ import torch.nn as nn
 from models import MLP
 from ops import (
     cosine_similarity_matrix,
+    expand_layer_continuous,
+    expand_layer_net2net,
     expand_model_continuous,
     expand_model_net2net,
+    layer_similarity_scores,
+    params_after_doubling_layer,
     permute_layer_neurons,
     resample_1d,
     resample_2d_cols,
@@ -480,3 +484,131 @@ class TestNet2NetTrainability:
             loss = out.sum()
             loss.backward()
             optimizer.step()
+
+
+# --- Test layer similarity scoring ---
+
+
+class TestLayerSimilarityScores:
+    def test_returns_correct_count(self, tiny_model_4layer):
+        scores = layer_similarity_scores(tiny_model_4layer)
+        assert len(scores) == 4  # 4 hidden layers
+
+    def test_scores_in_valid_range(self, tiny_model_4layer):
+        scores = layer_similarity_scores(tiny_model_4layer)
+        for s in scores:
+            assert -1.0 <= s <= 1.0, f"Score {s} out of range"
+
+    def test_does_not_modify_model(self, tiny_model_2layer, device):
+        """Scoring should not change the model's output."""
+        tiny_model_2layer.eval()
+        x = torch.randn(4, TEST_INPUT_DIM, device=device)
+        out_before = tiny_model_2layer(x).clone()
+
+        _ = layer_similarity_scores(tiny_model_2layer)
+
+        out_after = tiny_model_2layer(x)
+        assert torch.allclose(out_before, out_after, atol=1e-6)
+
+
+class TestParamsAfterDoubling:
+    def test_increases_params(self, tiny_model_4layer):
+        current = sum(p.numel() for p in tiny_model_4layer.parameters())
+        for i in range(4):
+            new_params = params_after_doubling_layer(tiny_model_4layer, i)
+            assert new_params > current
+
+    def test_doubling_middle_layer_affects_two_weight_matrices(self, tiny_model_2layer):
+        """Doubling layer 0 should increase fc0 rows and fc1 cols."""
+        old_params = sum(p.numel() for p in tiny_model_2layer.parameters())
+        new_params = params_after_doubling_layer(tiny_model_2layer, 0)
+        # Layer 0: [16, 64] -> [32, 64] (+16*64 + 16 bias)
+        # Layer 1: [16, 16] -> [16, 32] (+16*16)
+        expected_increase = TINY_WIDTH * TEST_INPUT_DIM + TINY_WIDTH + TINY_WIDTH * TINY_WIDTH
+        assert new_params == old_params + expected_increase
+
+
+# --- Test single-layer expansion ---
+
+
+class TestSingleLayerExpansion:
+    def test_csr_expands_only_target_layer(self, tiny_model_4layer, device):
+        optimizer = torch.optim.AdamW(tiny_model_4layer.parameters(), lr=1e-3)
+        x = torch.randn(4, TEST_INPUT_DIM, device=device)
+        loss = tiny_model_4layer(x).sum()
+        loss.backward()
+        optimizer.step()
+
+        new_model = expand_layer_continuous(tiny_model_4layer, 2, optimizer)
+
+        # Layer 2 should be doubled, others unchanged
+        assert new_model.hidden_widths == (TINY_WIDTH, TINY_WIDTH, EXPANDED_WIDTH, TINY_WIDTH)
+
+    def test_net2net_single_layer_function_preserving(self, tiny_model_4layer, device):
+        tiny_model_4layer.eval()
+        optimizer = torch.optim.AdamW(tiny_model_4layer.parameters(), lr=1e-3)
+        x = torch.randn(8, TEST_INPUT_DIM, device=device)
+        out_before = tiny_model_4layer(x).clone()
+
+        new_model = expand_layer_net2net(tiny_model_4layer, 1, optimizer, noise_std=0.0)
+        new_model.eval()
+        out_after = new_model(x)
+
+        assert torch.allclose(out_before, out_after, atol=1e-4), (
+            f"Max diff: {(out_before - out_after).abs().max():.6f}"
+        )
+
+    def test_can_train_after_single_layer_csr(self, tiny_model_4layer, device):
+        optimizer = torch.optim.AdamW(tiny_model_4layer.parameters(), lr=1e-3)
+        x = torch.randn(4, TEST_INPUT_DIM, device=device)
+        loss = tiny_model_4layer(x).sum()
+        loss.backward()
+        optimizer.step()
+
+        new_model = expand_layer_continuous(tiny_model_4layer, 0, optimizer)
+
+        for _ in range(3):
+            optimizer.zero_grad()
+            out = new_model(x)
+            loss = out.sum()
+            loss.backward()
+            optimizer.step()
+
+    def test_can_expand_multiple_layers_sequentially(self, tiny_model_4layer, device):
+        """Expand layer 0, then layer 2, then train."""
+        optimizer = torch.optim.AdamW(tiny_model_4layer.parameters(), lr=1e-3)
+        x = torch.randn(4, TEST_INPUT_DIM, device=device)
+        loss = tiny_model_4layer(x).sum()
+        loss.backward()
+        optimizer.step()
+
+        model = expand_layer_continuous(tiny_model_4layer, 0, optimizer)
+        assert model.hidden_widths == (EXPANDED_WIDTH, TINY_WIDTH, TINY_WIDTH, TINY_WIDTH)
+
+        model = expand_layer_continuous(model, 2, optimizer)
+        assert model.hidden_widths == (EXPANDED_WIDTH, TINY_WIDTH, EXPANDED_WIDTH, TINY_WIDTH)
+
+        # Should be trainable
+        for _ in range(3):
+            optimizer.zero_grad()
+            out = model(x)
+            loss = out.sum()
+            loss.backward()
+            optimizer.step()
+
+    def test_optimizer_state_correct_after_single_layer(self, tiny_model_4layer, device):
+        optimizer = torch.optim.AdamW(tiny_model_4layer.parameters(), lr=1e-3)
+        x = torch.randn(4, TEST_INPUT_DIM, device=device)
+        loss = tiny_model_4layer(x).sum()
+        loss.backward()
+        optimizer.step()
+
+        new_model = expand_layer_continuous(tiny_model_4layer, 1, optimizer)
+
+        for param in new_model.parameters():
+            if param in optimizer.state:
+                state = optimizer.state[param]
+                if "exp_avg" in state:
+                    assert state["exp_avg"].shape == param.shape
+                if "exp_avg_sq" in state:
+                    assert state["exp_avg_sq"].shape == param.shape

@@ -3,7 +3,9 @@
 This module implements:
 - Spectral Seriation (canonical sorting of neurons via Fiedler vector)
 - Linear resampling of weight matrices
-- Full model expansion for both CSR and Net2Net methods
+- Full model expansion (all layers) for both CSR and Net2Net methods
+- Targeted single-layer expansion for both CSR and Net2Net
+- Layer similarity scoring for targeted expansion decisions
 - Optimizer state handling (permutation + interpolation)
 
 All expansion functions work with MLP models of arbitrary depth.
@@ -53,24 +55,95 @@ def spectral_sort(incoming: torch.Tensor, outgoing: torch.Tensor) -> torch.Tenso
         f"Dimension mismatch: incoming has {N} neurons, outgoing has {outgoing.shape[1]}"
     )
 
-    # Construct feature vectors: concat incoming weights + outgoing weights
     features = torch.cat([incoming, outgoing.T], dim=1)
 
-    # Cosine similarity matrix, shifted to non-negative
     S = cosine_similarity_matrix(features)
     S_shifted = (S + 1.0) / 2.0
     S_shifted.fill_diagonal_(0.0)
 
-    # Graph Laplacian: L = D - S
     D = S_shifted.sum(dim=1)
     L = torch.diag(D) - S_shifted
 
-    # Fiedler vector (second-smallest eigenvector)
     eigenvalues, eigenvectors = torch.linalg.eigh(L)
     fiedler_vector = eigenvectors[:, 1]
 
     perm = torch.argsort(fiedler_vector)
     return perm
+
+
+def layer_similarity_scores(model: MLP) -> list[float]:
+    """Compute the average adjacent cosine similarity for each hidden layer after seriation.
+
+    For each hidden layer:
+    1. Sort neurons via spectral seriation (without modifying the model)
+    2. Compute cosine similarity between each pair of adjacent neurons in sorted order
+    3. Return the mean adjacent similarity
+
+    Lower scores indicate layers that are "stretched thin" and would benefit from expansion.
+
+    Args:
+        model: The MLP model.
+
+    Returns:
+        List of similarity scores, one per hidden layer.
+    """
+    scores = []
+    num_hidden = model.num_hidden_layers
+
+    for i in range(num_hidden):
+        incoming = model.layers[i].weight.data
+        outgoing = model.layers[i + 1].weight.data
+
+        # Sort without modifying the model
+        perm = spectral_sort(incoming, outgoing)
+
+        # Construct sorted feature vectors
+        features = torch.cat([incoming, outgoing.T], dim=1)
+        sorted_features = features[perm]
+
+        # Compute adjacent cosine similarity
+        if sorted_features.shape[0] < 2:
+            scores.append(1.0)
+            continue
+
+        norms = sorted_features.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        normalized = sorted_features / norms
+
+        # Adjacent similarities: dot product of row i and row i+1
+        adj_sims = (normalized[:-1] * normalized[1:]).sum(dim=1)
+        scores.append(adj_sims.mean().item())
+
+    return scores
+
+
+def params_after_doubling_layer(model: MLP, layer_idx: int) -> int:
+    """Compute total parameter count if hidden layer layer_idx were doubled.
+
+    Args:
+        model: The MLP model.
+        layer_idx: Which hidden layer to consider doubling (0-indexed).
+
+    Returns:
+        Total parameter count after doubling.
+    """
+    total = 0
+    old_width = model.layers[layer_idx].out_features
+    new_width = old_width * 2
+
+    for i in range(len(model.layers)):
+        rows = model.layers[i].out_features
+        cols = model.layers[i].in_features
+
+        # If this layer's output is being doubled
+        if i == layer_idx:
+            rows = new_width
+        # If this layer's input is being doubled (next layer after expanded)
+        if i == layer_idx + 1:
+            cols = new_width
+
+        total += rows * cols + rows  # weight + bias
+
+    return total
 
 
 def permute_layer_neurons(
@@ -79,19 +152,7 @@ def permute_layer_neurons(
     perm: torch.Tensor,
     optimizer: torch.optim.Optimizer | None = None,
 ) -> None:
-    """Permute neurons in a hidden layer, updating weights, biases, and optimizer state.
-
-    For hidden layer `layer_idx` (0-indexed into hidden layers):
-    - Permute rows of layers[layer_idx].weight and bias
-    - Permute columns of layers[layer_idx + 1].weight
-    - Permute corresponding optimizer state buffers
-
-    Args:
-        model: The MLP model.
-        layer_idx: Which hidden layer to permute (0 to num_hidden_layers-1).
-        perm: Permutation indices [N].
-        optimizer: Optional optimizer whose state should also be permuted.
-    """
+    """Permute neurons in a hidden layer, updating weights, biases, and optimizer state."""
     current_layer = model.layers[layer_idx]
     next_layer = model.layers[layer_idx + 1]
 
@@ -140,38 +201,174 @@ def resample_2d_cols(weight: torch.Tensor, new_cols: int) -> torch.Tensor:
     return x.squeeze(0)
 
 
+# ---------------------------------------------------------------------------
+# Targeted single-layer expansion
+# ---------------------------------------------------------------------------
+
+
+def expand_layer_continuous(
+    model: MLP,
+    layer_idx: int,
+    optimizer: torch.optim.Optimizer,
+) -> MLP:
+    """Expand a single hidden layer via CSR (double its width).
+
+    1. Sort the target layer via spectral seriation
+    2. Resample its weights/bias from W -> 2W via linear interpolation
+    3. Resample the next layer's input dimension to match
+    4. Scale outgoing weights for energy preservation
+
+    Args:
+        model: The MLP model.
+        layer_idx: Which hidden layer to expand (0-indexed).
+        optimizer: The optimizer (state will be resampled).
+
+    Returns:
+        New MLP with the target layer doubled.
+    """
+    device = next(model.parameters()).device
+    num_hidden = model.num_hidden_layers
+
+    assert 0 <= layer_idx < num_hidden, f"layer_idx {layer_idx} out of range [0, {num_hidden})"
+
+    # Sort the target layer
+    incoming = model.layers[layer_idx].weight.data
+    outgoing = model.layers[layer_idx + 1].weight.data
+    perm = spectral_sort(incoming, outgoing)
+    permute_layer_neurons(model, layer_idx, perm, optimizer)
+
+    # Build new model with the target layer doubled
+    old_widths = list(model.hidden_widths)
+    old_width = old_widths[layer_idx]
+    new_width = old_width * 2
+    new_widths = list(old_widths)
+    new_widths[layer_idx] = new_width
+
+    new_model = MLP(
+        input_dim=model.input_dim,
+        hidden_widths=new_widths,
+        dropout=model.dropout_rate,
+        num_classes=model.layers[-1].out_features,
+    ).to(device)
+
+    with torch.no_grad():
+        for i in range(len(model.layers)):
+            old_w = model.layers[i].weight.data
+            old_b = model.layers[i].bias.data
+            new_layer = new_model.layers[i]
+
+            old_rows, old_cols = old_w.shape
+            new_rows, new_cols = new_layer.weight.shape
+
+            w = old_w
+
+            # Resample columns (input dim changed because previous layer expanded)
+            if old_cols != new_cols:
+                w = resample_2d_cols(w, new_cols)
+                w = w * (old_cols / new_cols)  # energy preservation
+
+            # Resample rows (this layer expanded)
+            if old_rows != new_rows:
+                w = resample_2d_rows(w, new_rows)
+
+            new_layer.weight.data = w
+
+            if old_b.shape[0] != new_layer.bias.shape[0]:
+                new_layer.bias.data = resample_1d(old_b, new_layer.bias.shape[0])
+            else:
+                new_layer.bias.data = old_b.clone()
+
+    _resample_optimizer_state(optimizer, model, new_model)
+    return new_model
+
+
+def expand_layer_net2net(
+    model: MLP,
+    layer_idx: int,
+    optimizer: torch.optim.Optimizer,
+    noise_std: float = 1e-3,
+) -> MLP:
+    """Expand a single hidden layer via Net2Net (double its width).
+
+    Each neuron is duplicated once. Outgoing weights scaled by 0.5.
+
+    Args:
+        model: The MLP model.
+        layer_idx: Which hidden layer to expand (0-indexed).
+        optimizer: The optimizer (state will be duplicated).
+        noise_std: Standard deviation of symmetry-breaking noise.
+
+    Returns:
+        New MLP with the target layer doubled.
+    """
+    device = next(model.parameters()).device
+    num_hidden = model.num_hidden_layers
+
+    assert 0 <= layer_idx < num_hidden
+
+    old_widths = list(model.hidden_widths)
+    old_width = old_widths[layer_idx]
+    new_width = old_width * 2
+    new_widths = list(old_widths)
+    new_widths[layer_idx] = new_width
+
+    new_model = MLP(
+        input_dim=model.input_dim,
+        hidden_widths=new_widths,
+        dropout=model.dropout_rate,
+        num_classes=model.layers[-1].out_features,
+    ).to(device)
+
+    with torch.no_grad():
+        for i in range(len(model.layers)):
+            old_w = model.layers[i].weight.data
+            old_b = model.layers[i].bias.data
+            old_rows, old_cols = old_w.shape
+            new_layer = new_model.layers[i]
+            new_rows, new_cols = new_layer.weight.shape
+
+            # Expand columns (input dim) if previous layer was expanded
+            if old_cols != new_cols:
+                w = torch.cat([old_w * 0.5, old_w * 0.5], dim=1)
+            else:
+                w = old_w.clone()
+
+            # Expand rows (this layer's neurons)
+            if old_rows != new_rows:
+                w_dup = w.clone() + torch.randn_like(w) * noise_std
+                w = torch.cat([w, w_dup], dim=0)
+                b_dup = old_b.clone() + torch.randn_like(old_b) * noise_std
+                new_layer.bias.data = torch.cat([old_b, b_dup], dim=0)
+            else:
+                new_layer.bias.data = old_b.clone()
+
+            new_layer.weight.data = w
+
+    _duplicate_optimizer_state(optimizer, model, new_model)
+    return new_model
+
+
+# ---------------------------------------------------------------------------
+# Uniform all-layer expansion (kept for backward compatibility)
+# ---------------------------------------------------------------------------
+
+
 def expand_model_continuous(
     model: MLP,
     new_width: int,
     optimizer: torch.optim.Optimizer,
 ) -> MLP:
-    """Expand all hidden layers to new_width via Continuous Signal Resampling.
-
-    Algorithm:
-    1. Sort all hidden layers via spectral seriation
-    2. Resample all weights/biases to new_width via linear interpolation
-    3. Scale outgoing weights by (old_width / new_width) for energy preservation
-    4. Apply same operations to optimizer state
-
-    Args:
-        model: The MLP to expand.
-        new_width: Target width for all hidden layers.
-        optimizer: The optimizer (state will be resampled).
-
-    Returns:
-        New MLP with expanded widths (same device as input).
-    """
+    """Expand all hidden layers to new_width via Continuous Signal Resampling."""
     device = next(model.parameters()).device
     num_hidden = model.num_hidden_layers
 
-    # Phase 1: Sort all hidden layers
+    # Sort all hidden layers
     for i in range(num_hidden):
         incoming = model.layers[i].weight.data
         outgoing = model.layers[i + 1].weight.data
         perm = spectral_sort(incoming, outgoing)
         permute_layer_neurons(model, i, perm, optimizer)
 
-    # Phase 2 & 3: Build new model and resample
     old_widths = list(model.hidden_widths)
     new_widths = [new_width] * num_hidden
 
@@ -188,33 +385,26 @@ def expand_model_continuous(
             old_b = model.layers[i].bias.data
             new_layer = new_model.layers[i]
 
-            # Determine what resampling is needed
             old_rows, old_cols = old_w.shape
             new_rows, new_cols = new_layer.weight.shape
 
             w = old_w
 
-            # Resample columns first (input dimension expansion from previous layer)
             if old_cols != new_cols:
                 w = resample_2d_cols(w, new_cols)
-                # Energy preservation: scale by old_cols/new_cols
                 w = w * (old_cols / new_cols)
 
-            # Resample rows (this layer's neuron expansion)
             if old_rows != new_rows:
                 w = resample_2d_rows(w, new_rows)
 
             new_layer.weight.data = w
 
-            # Bias: resample if size changed, otherwise clone
             if old_b.shape[0] != new_layer.bias.shape[0]:
                 new_layer.bias.data = resample_1d(old_b, new_layer.bias.shape[0])
             else:
                 new_layer.bias.data = old_b.clone()
 
-    # Resample optimizer state
     _resample_optimizer_state(optimizer, model, new_model)
-
     return new_model
 
 
@@ -224,29 +414,13 @@ def expand_model_net2net(
     optimizer: torch.optim.Optimizer,
     noise_std: float = 1e-3,
 ) -> MLP:
-    """Expand all hidden layers to new_width via Net2Net (duplication with noise).
-
-    Each hidden neuron is duplicated exactly once (2x expansion).
-    Incoming weights get small noise added; outgoing weights are scaled by 0.5.
-
-    Args:
-        model: The MLP to expand.
-        new_width: Target width for all hidden layers (must be 2x current).
-        optimizer: The optimizer (state will be duplicated).
-        noise_std: Standard deviation of symmetry-breaking noise.
-
-    Returns:
-        New MLP with expanded widths.
-    """
+    """Expand all hidden layers to new_width via Net2Net."""
     device = next(model.parameters()).device
     num_hidden = model.num_hidden_layers
 
     for i in range(num_hidden):
         old_w = model.layers[i].out_features
-        assert new_width == 2 * old_w, (
-            f"Net2Net expects exact 2x expansion, but layer {i} has width "
-            f"{old_w} and target is {new_width}"
-        )
+        assert new_width == 2 * old_w
 
     new_widths = [new_width] * num_hidden
 
@@ -267,19 +441,15 @@ def expand_model_net2net(
 
             is_output_layer = (i == len(model.layers) - 1)
 
-            # Expand columns (input dim) if previous layer was expanded
             if old_cols != new_cols:
-                # Duplicate columns and scale by 0.5
                 w = torch.cat([old_w * 0.5, old_w * 0.5], dim=1)
             else:
                 w = old_w.clone()
 
-            # Expand rows (this layer's neurons) if this is a hidden layer
             if old_rows != new_rows:
-                assert not is_output_layer, "Output layer should not be expanded"
+                assert not is_output_layer
                 w_dup = w.clone() + torch.randn_like(w) * noise_std
                 w = torch.cat([w, w_dup], dim=0)
-
                 b_dup = old_b.clone() + torch.randn_like(old_b) * noise_std
                 new_layer.bias.data = torch.cat([old_b, b_dup], dim=0)
             else:
@@ -287,10 +457,13 @@ def expand_model_net2net(
 
             new_layer.weight.data = w
 
-    # Duplicate optimizer state
     _duplicate_optimizer_state(optimizer, model, new_model)
-
     return new_model
+
+
+# ---------------------------------------------------------------------------
+# Optimizer state helpers
+# ---------------------------------------------------------------------------
 
 
 def _resample_optimizer_state(
