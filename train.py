@@ -1,6 +1,7 @@
 """Training loop with TensorBoard logging and model expansion support."""
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -27,12 +28,13 @@ logger = logging.getLogger(__name__)
 class TrainConfig:
     """Training configuration.
 
-    The expansion schedule is defined by:
-    - width_schedule: list of hidden widths, e.g., [128, 256, 512, 1024]
-      The first entry is the initial width; each subsequent entry triggers an expansion.
-    - epochs_per_stage: list of epoch counts for each stage, e.g., [20, 20, 20, 40]
-      Must have the same length as width_schedule.
-      The scratch baseline trains at the final width for sum(epochs_per_stage) epochs.
+    For uniform mode:
+    - width_schedule + epochs_per_stage define fixed expansion timing.
+
+    For targeted mode:
+    - patience: number of epochs without val loss improvement before expanding/stopping.
+    - min_epochs_per_stage: minimum epochs to train before checking patience.
+    - base_lr: learning rate at initial_width. Scaled by sqrt(base_params/current_params).
     """
 
     lr: float = 1e-3
@@ -42,9 +44,13 @@ class TrainConfig:
     input_dim: int = 3072
     num_hidden_layers: int = 4
     dropout: float = 0.2
+    # Uniform mode settings
     width_schedule: list[int] = field(default_factory=lambda: [128, 256, 512, 1024, 2048])
     epochs_per_stage: list[int] = field(default_factory=lambda: [15, 15, 15, 15, 30])
-    epochs_per_targeted_stage: int = 15
+    # Targeted mode settings
+    patience: int = 5
+    min_epochs_per_stage: int = 3
+    max_epochs: int = 500  # safety cap
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     @property
@@ -98,6 +104,24 @@ class TrainConfig:
         )
         return sum(p.numel() for p in ref.parameters())
 
+    @property
+    def base_params(self) -> int:
+        """Parameter count of the initial small model."""
+        ref = MLP(
+            input_dim=self.input_dim,
+            hidden_widths=[self.initial_width] * self.num_hidden_layers,
+        )
+        return sum(p.numel() for p in ref.parameters())
+
+
+def compute_scaled_lr(base_lr: float, base_params: int, current_params: int) -> float:
+    """Compute learning rate scaled by sqrt(base_params / current_params).
+
+    As the model grows, the LR decreases proportionally to the square root
+    of the parameter ratio, preventing excessively large updates.
+    """
+    return base_lr * math.sqrt(base_params / current_params)
+
 
 @dataclass
 class ExpansionEvent:
@@ -112,7 +136,7 @@ class ExpansionEvent:
     loss_after_first_epoch: float
     acc_before: float
     acc_after_first_epoch: float
-    layer_idx: int | None = None  # For targeted expansion
+    layer_idx: int | None = None
 
     @property
     def shock(self) -> float:
@@ -154,6 +178,131 @@ def evaluate(
     return total_loss / total, correct / total
 
 
+def _train_one_epoch(
+    model: MLP,
+    optimizer: torch.optim.Optimizer,
+    train_loader: DataLoader,
+    criterion: nn.Module,
+    device: str,
+    writer: SummaryWriter,
+    tag_prefix: str,
+    epoch: int,
+    total_epochs_display: int,
+    global_step: int,
+) -> tuple[int, float, float]:
+    """Train for one epoch. Returns (global_step, train_loss, train_acc)."""
+    model.train()
+    epoch_loss = 0.0
+    epoch_correct = 0
+    epoch_total = 0
+
+    pbar = tqdm(
+        train_loader,
+        desc=f"[{tag_prefix}] Epoch {epoch+1}/{total_epochs_display}",
+        leave=False,
+    )
+
+    for images, labels in pbar:
+        images, labels = images.to(device), labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        batch_loss = loss.item()
+        _, predicted = outputs.max(1)
+        batch_correct = predicted.eq(labels).sum().item()
+        batch_total = images.size(0)
+
+        epoch_loss += batch_loss * batch_total
+        epoch_correct += batch_correct
+        epoch_total += batch_total
+
+        writer.add_scalar(f"{tag_prefix}/Loss/Train", batch_loss, global_step)
+        global_step += 1
+
+        pbar.set_postfix(loss=f"{batch_loss:.4f}", acc=f"{batch_correct/batch_total:.4f}")
+
+    train_loss = epoch_loss / epoch_total
+    train_acc = epoch_correct / epoch_total
+    return global_step, train_loss, train_acc
+
+
+def _train_until_plateau(
+    model: MLP,
+    optimizer: torch.optim.Optimizer,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    criterion: nn.Module,
+    device: str,
+    writer: SummaryWriter,
+    tag_prefix: str,
+    start_epoch: int,
+    patience: int,
+    min_epochs: int,
+    max_epochs: int,
+    global_step: int,
+) -> tuple[int, int, float, float]:
+    """Train until validation loss plateaus.
+
+    Returns (global_step, epochs_trained, best_val_loss, final_val_acc).
+    """
+    best_val_loss = float("inf")
+    epochs_without_improvement = 0
+    epoch = start_epoch
+    epochs_trained = 0
+    val_loss = float("inf")
+    val_acc = 0.0
+
+    while epochs_trained < max_epochs:
+        global_step, train_loss, train_acc = _train_one_epoch(
+            model, optimizer, train_loader, criterion, device,
+            writer, tag_prefix, epoch, start_epoch + max_epochs, global_step,
+        )
+
+        val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+
+        writer.add_scalar(f"{tag_prefix}/Loss/Val", val_loss, global_step)
+        writer.add_scalar(f"{tag_prefix}/Accuracy/Train", train_acc, global_step)
+        writer.add_scalar(f"{tag_prefix}/Accuracy/Val", val_acc, global_step)
+
+        current_lr = optimizer.param_groups[0]["lr"]
+        writer.add_scalar(f"{tag_prefix}/LR", current_lr, global_step)
+
+        logger.info(
+            f"[{tag_prefix}] Epoch {epoch+1} | "
+            f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
+            f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} | "
+            f"lr={current_lr:.6f} | patience={epochs_without_improvement}/{patience}"
+        )
+
+        epoch += 1
+        epochs_trained += 1
+
+        # Check plateau after min_epochs
+        if val_loss < best_val_loss - 1e-4:
+            best_val_loss = val_loss
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        if epochs_trained >= min_epochs and epochs_without_improvement >= patience:
+            logger.info(
+                f"[{tag_prefix}] Plateau detected after {epochs_trained} epochs "
+                f"(best_val_loss={best_val_loss:.4f})"
+            )
+            break
+
+    return global_step, epochs_trained, val_loss, val_acc
+
+
+# ---------------------------------------------------------------------------
+# Uniform expansion protocol (kept for backward compatibility)
+# ---------------------------------------------------------------------------
+
+
 def _train_epochs(
     model: MLP,
     optimizer: torch.optim.Optimizer,
@@ -169,47 +318,15 @@ def _train_epochs(
     total_epochs: int,
     global_step: int,
 ) -> tuple[int, float, float]:
-    """Train for a fixed number of epochs. Returns (global_step, val_loss, val_acc)."""
+    """Train for a fixed number of epochs (uniform mode). Returns (global_step, val_loss, val_acc)."""
+    val_loss = 0.0
+    val_acc = 0.0
     for epoch in range(start_epoch, start_epoch + num_epochs):
-        model.train()
-        epoch_loss = 0.0
-        epoch_correct = 0
-        epoch_total = 0
-
-        pbar = tqdm(
-            train_loader,
-            desc=f"[{tag_prefix}] Epoch {epoch+1}/{total_epochs}",
-            leave=False,
+        global_step, train_loss, train_acc = _train_one_epoch(
+            model, optimizer, train_loader, criterion, device,
+            writer, tag_prefix, epoch, total_epochs, global_step,
         )
 
-        for images, labels in pbar:
-            images, labels = images.to(device), labels.to(device)
-
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            batch_loss = loss.item()
-            _, predicted = outputs.max(1)
-            batch_correct = predicted.eq(labels).sum().item()
-            batch_total = images.size(0)
-
-            epoch_loss += batch_loss * batch_total
-            epoch_correct += batch_correct
-            epoch_total += batch_total
-
-            writer.add_scalar(f"{tag_prefix}/Loss/Train", batch_loss, global_step)
-            global_step += 1
-
-            pbar.set_postfix(
-                loss=f"{batch_loss:.4f}",
-                acc=f"{batch_correct/batch_total:.4f}",
-            )
-
-        train_loss = epoch_loss / epoch_total
-        train_acc = epoch_correct / epoch_total
         val_loss, val_acc = evaluate(model, val_loader, criterion, device)
 
         writer.add_scalar(f"{tag_prefix}/Loss/Val", val_loss, global_step)
@@ -243,7 +360,6 @@ def train_protocol(
     criterion = nn.CrossEntropyLoss()
     total_epochs = config.total_epochs
 
-    # Initialize model
     if protocol == "scratch":
         model = MLP(
             input_dim=config.input_dim,
@@ -326,7 +442,6 @@ def train_protocol(
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, T_max=stage_epochs, eta_min=1e-6
             )
-            logger.info(f"[{tag_prefix}] LR scheduler reset: T_max={stage_epochs}, lr={config.lr}")
 
             pending_shock = {
                 "expansion_index": exp_idx,
@@ -338,7 +453,6 @@ def train_protocol(
                 "acc_before": val_acc_before,
             }
 
-        # Training epoch
         model.train()
         epoch_loss = 0.0
         epoch_correct = 0
@@ -404,9 +518,7 @@ def train_protocol(
                 acc_after_first_epoch=val_acc,
             )
             expansion_events.append(event)
-
             writer.add_scalar(f"{tag_prefix}/Expansion_Shock", event.shock, pending_shock["step"])
-
             logger.info(
                 f"[{tag_prefix}] Expansion {event.expansion_index+1} shock (after 1 epoch): "
                 f"{event.width_before}->{event.width_after} "
@@ -424,6 +536,11 @@ def train_protocol(
     }
 
 
+# ---------------------------------------------------------------------------
+# Targeted expansion protocol (patience-based, with sqrt LR scaling)
+# ---------------------------------------------------------------------------
+
+
 def train_targeted(
     method: Literal["continuous", "net2net"],
     train_loader: DataLoader,
@@ -433,12 +550,17 @@ def train_targeted(
     tag_prefix: str,
     expansion_plan: list[TargetedExpansionStep] | None = None,
 ) -> dict:
-    """Run a targeted expansion protocol.
+    """Run a targeted expansion protocol with patience-based stage transitions.
 
-    If expansion_plan is None (CSR mode), dynamically chooses which layer to
-    expand based on similarity scores, recording the plan.
+    Training loop:
+    1. Train until val loss plateaus (patience epochs without improvement)
+    2. Score layers by post-seriation adjacent cosine similarity
+    3. Expand the least similar layer that fits within parameter budget
+    4. Set LR = base_lr * sqrt(base_params / current_params)
+    5. Repeat from 1 until budget exhausted
+    6. Final stage: train until plateau, then stop
 
-    If expansion_plan is provided (Net2Net replay mode), follows the plan exactly.
+    If expansion_plan is provided, replays the plan (for Net2Net comparison).
 
     Args:
         method: 'continuous' for CSR, 'net2net' for Net2Net replay.
@@ -447,7 +569,7 @@ def train_targeted(
         config: Training configuration.
         writer: TensorBoard writer.
         tag_prefix: Prefix for logging tags.
-        expansion_plan: If provided, replay this plan. If None, build plan dynamically.
+        expansion_plan: If provided, replay this plan. If None, build dynamically.
 
     Returns:
         Dict with results including the expansion plan used.
@@ -455,7 +577,8 @@ def train_targeted(
     device = config.device
     criterion = nn.CrossEntropyLoss()
     param_budget = config.param_budget
-    epochs_per_stage = config.epochs_per_targeted_stage
+    base_params = config.base_params
+    base_lr = config.lr
 
     # Initialize small model
     model = MLP(
@@ -464,53 +587,43 @@ def train_targeted(
         dropout=config.dropout,
     ).to(device)
 
+    current_params = sum(p.numel() for p in model.parameters())
+    current_lr = compute_scaled_lr(base_lr, base_params, current_params)
+
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=config.lr, weight_decay=config.weight_decay
+        model.parameters(), lr=current_lr, weight_decay=config.weight_decay
     )
 
     dynamic = expansion_plan is None
     if dynamic:
         expansion_plan = []
 
-    current_params = sum(p.numel() for p in model.parameters())
     global_step = 0
     epoch_counter = 0
     expansion_events: list[ExpansionEvent] = []
     exp_idx = 0
 
-    # Determine total epochs: initial stage + (N expansions * epochs_per_stage) + final stage
-    # We don't know N ahead of time for dynamic mode, so we compute total at the end.
-    # For replay mode, we know the plan length.
-    if not dynamic:
-        num_expansions = len(expansion_plan)
-    else:
-        num_expansions = None  # unknown
-
     logger.info(
         f"[{tag_prefix}] Starting targeted training: {method} | "
         f"Model widths: {model.hidden_widths} | "
-        f"Param budget: {param_budget:,} | Current params: {current_params:,}"
+        f"Param budget: {param_budget:,} | Current params: {current_params:,} | "
+        f"LR: {current_lr:.6f} | Patience: {config.patience}"
     )
 
-    # --- Initial training stage ---
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=epochs_per_stage, eta_min=1e-6
+    # --- Initial training stage: train until plateau ---
+    global_step, epochs_trained, val_loss, val_acc = _train_until_plateau(
+        model, optimizer, train_loader, val_loader, criterion, device,
+        writer, tag_prefix, epoch_counter, config.patience, config.min_epochs_per_stage,
+        config.max_epochs, global_step,
     )
-    total_epochs_estimate = epochs_per_stage * 20  # generous upper bound for display
-    global_step, val_loss, val_acc = _train_epochs(
-        model, optimizer, scheduler, train_loader, val_loader, criterion, device,
-        writer, tag_prefix, epoch_counter, epochs_per_stage, total_epochs_estimate, global_step,
-    )
-    epoch_counter += epochs_per_stage
+    epoch_counter += epochs_trained
 
     # --- Expansion loop ---
-    while True:
+    while epoch_counter < config.max_epochs:
         if dynamic:
-            # Score layers and pick the least similar one that fits budget
             scores = layer_similarity_scores(model)
             widths = list(model.hidden_widths)
 
-            # Sort layers by similarity (ascending = least similar first)
             layer_order = sorted(range(len(scores)), key=lambda i: scores[i])
 
             chosen_layer = None
@@ -569,32 +682,29 @@ def train_targeted(
 
         current_params = sum(p.numel() for p in model.parameters())
 
+        # Scale LR by sqrt(base_params / current_params)
+        current_lr = compute_scaled_lr(base_lr, base_params, current_params)
+        for pg in optimizer.param_groups:
+            pg["lr"] = current_lr
+
         val_loss_immediate, val_acc_immediate = evaluate(model, val_loader, criterion, device)
         logger.info(
             f"[{tag_prefix}] Post-expansion: val_loss={val_loss_immediate:.4f}, "
             f"val_acc={val_acc_immediate:.4f} | widths={model.hidden_widths} | "
-            f"params={current_params:,}"
+            f"params={current_params:,} | lr={current_lr:.6f}"
         )
 
         writer.add_scalar(f"{tag_prefix}/Val_Loss_PreExpand", val_loss_before, global_step)
         writer.add_scalar(f"{tag_prefix}/Val_Loss_PostExpand_Immediate", val_loss_immediate, global_step)
         writer.add_scalar(f"{tag_prefix}/Params", current_params, global_step)
 
-        # Reset LR and train next stage
-        for pg in optimizer.param_groups:
-            pg["lr"] = config.lr
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=epochs_per_stage, eta_min=1e-6
+        # Train until plateau
+        global_step, epochs_trained, val_loss, val_acc = _train_until_plateau(
+            model, optimizer, train_loader, val_loader, criterion, device,
+            writer, tag_prefix, epoch_counter, config.patience, config.min_epochs_per_stage,
+            config.max_epochs - epoch_counter, global_step,
         )
 
-        global_step, val_loss, val_acc = _train_epochs(
-            model, optimizer, scheduler, train_loader, val_loader, criterion, device,
-            writer, tag_prefix, epoch_counter, epochs_per_stage, total_epochs_estimate,
-            global_step,
-        )
-
-        # Record shock (val_loss after first post-expansion epoch approximated by end-of-stage)
-        # For consistency we use the val_loss after the full stage
         event = ExpansionEvent(
             expansion_index=exp_idx,
             step=global_step,
@@ -610,27 +720,13 @@ def train_targeted(
         expansion_events.append(event)
 
         logger.info(
-            f"[{tag_prefix}] Expansion {exp_idx+1} result: "
+            f"[{tag_prefix}] Expansion {exp_idx+1} result ({epochs_trained} epochs): "
             f"layer {step.layer_idx} {step.old_width}->{step.new_width} "
             f"loss_delta={event.shock:+.4f}, acc_delta={event.acc_delta:+.4f}"
         )
 
-        epoch_counter += epochs_per_stage
+        epoch_counter += epochs_trained
         exp_idx += 1
-
-    # --- Final training stage (double length, like the uniform protocol) ---
-    final_stage_epochs = epochs_per_stage * 2
-    for pg in optimizer.param_groups:
-        pg["lr"] = config.lr
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=final_stage_epochs, eta_min=1e-6
-    )
-    global_step, val_loss, val_acc = _train_epochs(
-        model, optimizer, scheduler, train_loader, val_loader, criterion, device,
-        writer, tag_prefix, epoch_counter, final_stage_epochs, total_epochs_estimate,
-        global_step,
-    )
-    epoch_counter += final_stage_epochs
 
     final_val_loss, final_val_acc = evaluate(model, val_loader, criterion, device)
 

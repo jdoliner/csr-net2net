@@ -120,17 +120,18 @@ def run_targeted(args, config: TrainConfig, train_loader, val_loader, writer):
         f"val_loss={n2n_results['final_val_loss']:.4f}"
     )
 
-    # --- 3. Scratch (balanced architecture at final_width, same total epochs) ---
-    # Use balanced architecture rather than CSR's discovered one, since CSR's
-    # architecture is tuned to the expansion path and trains poorly from scratch.
+    # --- 3. Scratch (balanced architecture at final_width, patience-based stopping) ---
+    # Use balanced architecture, train with same sqrt-scaled LR and patience stopping.
     balanced_widths = [config.final_width] * config.num_hidden_layers
     torch.manual_seed(config.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(config.seed)
 
     logger.info(f"\n{'='*60}")
-    logger.info(f"Running protocol: Scratch (widths={balanced_widths}, epochs={total_epochs_used})")
+    logger.info(f"Running protocol: Scratch (widths={balanced_widths}, patience={config.patience})")
     logger.info(f"{'='*60}")
+
+    from train import _train_until_plateau, compute_scaled_lr, evaluate
 
     scratch_model = MLP(
         input_dim=config.input_dim,
@@ -139,21 +140,21 @@ def run_targeted(args, config: TrainConfig, train_loader, val_loader, writer):
     )
     device = config.device
     scratch_model = scratch_model.to(device)
+    scratch_params = sum(p.numel() for p in scratch_model.parameters())
+    scratch_lr = compute_scaled_lr(config.lr, config.base_params, scratch_params)
     scratch_optimizer = torch.optim.AdamW(
-        scratch_model.parameters(), lr=config.lr, weight_decay=config.weight_decay
-    )
-    scratch_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        scratch_optimizer, T_max=total_epochs_used, eta_min=1e-6
+        scratch_model.parameters(), lr=scratch_lr, weight_decay=config.weight_decay
     )
     criterion = torch.nn.CrossEntropyLoss()
 
-    start_time = time.time()
-    from train import _train_epochs, evaluate
+    logger.info(f"[Scratch_Targeted] Params: {scratch_params:,} | LR: {scratch_lr:.6f}")
 
-    global_step, val_loss, val_acc = _train_epochs(
-        scratch_model, scratch_optimizer, scratch_scheduler,
-        train_loader, val_loader, criterion, device,
-        writer, "Scratch_Targeted", 0, total_epochs_used, total_epochs_used, 0,
+    start_time = time.time()
+
+    global_step, epochs_trained, val_loss, val_acc = _train_until_plateau(
+        scratch_model, scratch_optimizer, train_loader, val_loader, criterion, device,
+        writer, "Scratch_Targeted", 0, config.patience, config.min_epochs_per_stage,
+        config.max_epochs, 0,
     )
     final_val_loss, final_val_acc = evaluate(scratch_model, val_loader, criterion, device)
     elapsed = time.time() - start_time
@@ -164,14 +165,15 @@ def run_targeted(args, config: TrainConfig, train_loader, val_loader, writer):
         "final_val_acc": final_val_acc,
         "expansion_events": [],
         "elapsed_time": elapsed,
-        "total_epochs": total_epochs_used,
+        "total_epochs": epochs_trained,
         "final_widths": tuple(balanced_widths),
     }
     all_results["scratch_targeted"] = scratch_results
 
     logger.info(
         f"[Scratch_Targeted] Completed in {elapsed:.1f}s | "
-        f"Final val_acc={final_val_acc:.4f} val_loss={final_val_loss:.4f}"
+        f"Final val_acc={final_val_acc:.4f} val_loss={final_val_loss:.4f} | "
+        f"epochs={epochs_trained}"
     )
 
     return all_results
@@ -244,7 +246,9 @@ def main():
         default=[15, 15, 15, 15, 30],
         help="Epochs per stage (uniform mode)",
     )
-    parser.add_argument("--epochs-per-targeted-stage", type=int, default=15)
+    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--min-epochs-per-stage", type=int, default=3)
+    parser.add_argument("--max-epochs", type=int, default=500)
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -283,7 +287,9 @@ def main():
         dropout=args.dropout,
         width_schedule=args.width_schedule,
         epochs_per_stage=args.epochs_per_stage,
-        epochs_per_targeted_stage=args.epochs_per_targeted_stage,
+        patience=args.patience,
+        min_epochs_per_stage=args.min_epochs_per_stage,
+        max_epochs=args.max_epochs,
         device=args.device,
     )
 
