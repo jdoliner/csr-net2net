@@ -120,18 +120,21 @@ def run_targeted(args, config: TrainConfig, train_loader, val_loader, writer):
         f"val_loss={n2n_results['final_val_loss']:.4f}"
     )
 
-    # --- 3. Scratch (same final architecture, same total epochs) ---
+    # --- 3. Scratch (balanced architecture at final_width, same total epochs) ---
+    # Use balanced architecture rather than CSR's discovered one, since CSR's
+    # architecture is tuned to the expansion path and trains poorly from scratch.
+    balanced_widths = [config.final_width] * config.num_hidden_layers
     torch.manual_seed(config.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(config.seed)
 
     logger.info(f"\n{'='*60}")
-    logger.info(f"Running protocol: Scratch (widths={final_widths}, epochs={total_epochs_used})")
+    logger.info(f"Running protocol: Scratch (widths={balanced_widths}, epochs={total_epochs_used})")
     logger.info(f"{'='*60}")
 
     scratch_model = MLP(
         input_dim=config.input_dim,
-        hidden_widths=list(final_widths),
+        hidden_widths=balanced_widths,
         dropout=config.dropout,
     )
     device = config.device
@@ -162,7 +165,7 @@ def run_targeted(args, config: TrainConfig, train_loader, val_loader, writer):
         "expansion_events": [],
         "elapsed_time": elapsed,
         "total_epochs": total_epochs_used,
-        "final_widths": final_widths,
+        "final_widths": tuple(balanced_widths),
     }
     all_results["scratch_targeted"] = scratch_results
 
