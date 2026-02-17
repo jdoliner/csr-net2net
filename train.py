@@ -33,6 +33,7 @@ class TrainConfig:
     batch_size: int = 256
     seed: int = 42
     input_dim: int = 3072
+    num_hidden_layers: int = 4
     dropout: float = 0.2
     width_schedule: list[int] = field(default_factory=lambda: [128, 256, 512, 1024, 2048])
     epochs_per_stage: list[int] = field(default_factory=lambda: [15, 15, 15, 15, 30])
@@ -179,16 +180,14 @@ def train_protocol(
     if protocol == "scratch":
         model = MLP(
             input_dim=config.input_dim,
-            hidden1=config.final_width,
-            hidden2=config.final_width,
+            hidden_widths=[config.final_width] * config.num_hidden_layers,
             dropout=config.dropout,
         ).to(device)
         expansion_schedule = {}  # No expansions
     else:
         model = MLP(
             input_dim=config.input_dim,
-            hidden1=config.initial_width,
-            hidden2=config.initial_width,
+            hidden_widths=[config.initial_width] * config.num_hidden_layers,
             dropout=config.dropout,
         ).to(device)
         # Map epoch -> (target_width, expansion_index)
@@ -233,7 +232,7 @@ def train_protocol(
         # --- Check for expansion ---
         if epoch in expansion_schedule:
             target_width, exp_idx = expansion_schedule[epoch]
-            width_before = model.fc1.out_features
+            width_before = model.hidden_widths[0]
 
             logger.info(
                 f"[{tag_prefix}] === EXPANSION {exp_idx+1} at epoch {epoch} "
@@ -250,11 +249,11 @@ def train_protocol(
             # Expand
             if protocol == "net2net":
                 model = expand_model_net2net(
-                    model, target_width, target_width, optimizer
+                    model, target_width, optimizer
                 )
             elif protocol == "continuous":
                 model = expand_model_continuous(
-                    model, target_width, target_width, optimizer
+                    model, target_width, optimizer
                 )
 
             # Evaluate immediately after expansion (for TensorBoard)

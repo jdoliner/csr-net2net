@@ -65,6 +65,7 @@ def main():
         help="Hidden widths for each stage (first is initial, rest are expansion targets)",
     )
     parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--num-hidden-layers", type=int, default=4)
     parser.add_argument(
         "--epochs-per-stage",
         type=int,
@@ -103,6 +104,7 @@ def main():
         batch_size=args.batch_size,
         seed=args.seed,
         input_dim=args.input_dim,
+        num_hidden_layers=args.num_hidden_layers,
         dropout=args.dropout,
         width_schedule=args.width_schedule,
         epochs_per_stage=args.epochs_per_stage,
