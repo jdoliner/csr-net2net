@@ -556,28 +556,20 @@ def train_targeted(
     1. Train until val loss plateaus (patience epochs without improvement)
     2. Score layers by post-seriation adjacent cosine similarity
     3. Expand the least similar layer that fits within parameter budget
-    4. Set LR = base_lr * sqrt(base_params / current_params)
+    4. Reset LR to base_lr (expansion methods need exploration after perturbation)
     5. Repeat from 1 until budget exhausted
     6. Final stage: train until plateau, then stop
 
+    Note: LR is always reset to base_lr after expansion, NOT sqrt-scaled.
+    The sqrt scaling is only used for the scratch baseline (which trains at
+    full size from the start). Expansion methods need the higher LR to explore
+    and integrate the newly created neurons.
+
     If expansion_plan is provided, replays the plan (for Net2Net comparison).
-
-    Args:
-        method: 'continuous' for CSR, 'net2net' for Net2Net replay.
-        train_loader: Training data.
-        val_loader: Validation data.
-        config: Training configuration.
-        writer: TensorBoard writer.
-        tag_prefix: Prefix for logging tags.
-        expansion_plan: If provided, replay this plan. If None, build dynamically.
-
-    Returns:
-        Dict with results including the expansion plan used.
     """
     device = config.device
     criterion = nn.CrossEntropyLoss()
     param_budget = config.param_budget
-    base_params = config.base_params
     base_lr = config.lr
 
     # Initialize small model
@@ -588,10 +580,9 @@ def train_targeted(
     ).to(device)
 
     current_params = sum(p.numel() for p in model.parameters())
-    current_lr = compute_scaled_lr(base_lr, base_params, current_params)
 
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=current_lr, weight_decay=config.weight_decay
+        model.parameters(), lr=base_lr, weight_decay=config.weight_decay
     )
 
     dynamic = expansion_plan is None
@@ -607,7 +598,7 @@ def train_targeted(
         f"[{tag_prefix}] Starting targeted training: {method} | "
         f"Model widths: {model.hidden_widths} | "
         f"Param budget: {param_budget:,} | Current params: {current_params:,} | "
-        f"LR: {current_lr:.6f} | Patience: {config.patience}"
+        f"LR: {base_lr:.6f} | Patience: {config.patience}"
     )
 
     # --- Initial training stage: train until plateau ---
@@ -682,16 +673,15 @@ def train_targeted(
 
         current_params = sum(p.numel() for p in model.parameters())
 
-        # Scale LR by sqrt(base_params / current_params)
-        current_lr = compute_scaled_lr(base_lr, base_params, current_params)
+        # Reset LR to base_lr — expansion methods need exploration after perturbation
         for pg in optimizer.param_groups:
-            pg["lr"] = current_lr
+            pg["lr"] = base_lr
 
         val_loss_immediate, val_acc_immediate = evaluate(model, val_loader, criterion, device)
         logger.info(
             f"[{tag_prefix}] Post-expansion: val_loss={val_loss_immediate:.4f}, "
             f"val_acc={val_acc_immediate:.4f} | widths={model.hidden_widths} | "
-            f"params={current_params:,} | lr={current_lr:.6f}"
+            f"params={current_params:,} | lr={base_lr:.6f}"
         )
 
         writer.add_scalar(f"{tag_prefix}/Val_Loss_PreExpand", val_loss_before, global_step)
