@@ -57,6 +57,7 @@ class TransformerConfig:
     patience: int = 3
     min_epochs_per_stage: int = 2
     max_epochs: int = 200
+    min_improvement: float = 0.001  # Relative threshold: loss must drop by at least 0.1%
 
     # Eval
     eval_interval_steps: int = 200  # Evaluate every N optimizer steps
@@ -343,7 +344,9 @@ def train_transformer_targeted(
                 f"patience={epochs_without_improvement}/{config.patience}"
             )
 
-            if val_loss < best_val_loss - 1e-4:
+            # Require relative improvement of min_improvement to reset patience
+            threshold = best_val_loss * (1.0 - config.min_improvement)
+            if val_loss < threshold:
                 best_val_loss = val_loss
                 epochs_without_improvement = 0
             else:
@@ -355,7 +358,8 @@ def train_transformer_targeted(
             ):
                 logger.info(
                     f"[{tag_prefix}] Plateau after {epochs_trained} epochs "
-                    f"(best={best_val_loss:.4f})"
+                    f"(best={best_val_loss:.4f}, "
+                    f"threshold={config.min_improvement*100:.1f}%)"
                 )
                 break
 
@@ -647,7 +651,8 @@ def run_transformer_experiment(config: TransformerConfig, log_dir: str):
             f"lr={scratch_lr:.6f} | patience={epochs_without_improvement}/{config.patience}"
         )
 
-        if val_loss < best_val_loss - 1e-4:
+        threshold = best_val_loss * (1.0 - config.min_improvement)
+        if val_loss < threshold:
             best_val_loss = val_loss
             epochs_without_improvement = 0
         else:
@@ -657,7 +662,10 @@ def run_transformer_experiment(config: TransformerConfig, log_dir: str):
             epoch_counter >= config.min_epochs_per_stage
             and epochs_without_improvement >= config.patience
         ):
-            logger.info(f"[Scratch] Plateau after {epoch_counter} epochs")
+            logger.info(
+                f"[Scratch] Plateau after {epoch_counter} epochs "
+                f"(threshold={config.min_improvement*100:.1f}%)"
+            )
             break
 
     final_loss, final_ppl = evaluate_lm(

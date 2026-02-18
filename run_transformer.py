@@ -32,6 +32,8 @@ def main():
     parser.add_argument("--patience", type=int, default=3)
     parser.add_argument("--min-epochs-per-stage", type=int, default=2)
     parser.add_argument("--max-epochs", type=int, default=200)
+    parser.add_argument("--min-improvement", type=float, default=0.001,
+                        help="Relative improvement threshold for patience (0.001 = 0.1%%)")
     parser.add_argument("--max-train-seqs", type=int, default=0,
                         help="Cap training sequences (0=use all)")
     parser.add_argument(
@@ -62,6 +64,7 @@ def main():
         patience=args.patience,
         min_epochs_per_stage=args.min_epochs_per_stage,
         max_epochs=args.max_epochs,
+        min_improvement=args.min_improvement,
         max_train_seqs=args.max_train_seqs,
         device=args.device,
     )
