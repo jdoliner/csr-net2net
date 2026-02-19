@@ -36,6 +36,8 @@ def main():
                         help="Relative improvement threshold for patience (0.001 = 0.1%%)")
     parser.add_argument("--max-train-seqs", type=int, default=0,
                         help="Cap training sequences (0=use all)")
+    parser.add_argument("--steps-per-epoch", type=int, default=0,
+                        help="Optimizer steps per epoch (0=full pass over data)")
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -66,6 +68,7 @@ def main():
         max_epochs=args.max_epochs,
         min_improvement=args.min_improvement,
         max_train_seqs=args.max_train_seqs,
+        steps_per_epoch=args.steps_per_epoch,
         device=args.device,
     )
 

@@ -9,6 +9,7 @@ Includes:
 import logging
 import math
 import os
+import random
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -64,6 +65,7 @@ class TransformerConfig:
 
     # Data
     max_train_seqs: int = 0  # 0 = use all data, >0 = cap training sequences
+    steps_per_epoch: int = 0  # 0 = full pass over data, >0 = fixed number of optimizer steps per epoch
 
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -199,12 +201,18 @@ def train_transformer_targeted(
     writer: SummaryWriter,
     tag_prefix: str,
     expansion_plan: list[TargetedExpansionStep] | None = None,
+    layer_selection: Literal["similarity", "random"] = "similarity",
 ) -> dict:
     """Train a transformer with targeted MLP expansion.
 
     Patience-based training: train until validation loss plateaus,
-    then expand the MLP block with lowest similarity score.
-    LR is reset to base_lr after each expansion.
+    then expand an MLP block and continue.
+
+    Layer selection:
+    - "similarity": expand the layer with lowest post-seriation adjacent cosine
+      similarity (most "stretched thin"). Used by CSR.
+    - "random": expand a randomly chosen layer that fits within budget.
+      Used by Net2Net as a fair baseline (no free architecture search).
 
     Args:
         method: 'continuous' for CSR, 'net2net' for Net2Net.
@@ -213,7 +221,8 @@ def train_transformer_targeted(
         config: Experiment configuration.
         writer: TensorBoard writer.
         tag_prefix: Prefix for logging.
-        expansion_plan: If provided, replay this plan.
+        expansion_plan: If provided, replay this plan (overrides layer_selection).
+        layer_selection: How to choose which layer to expand.
 
     Returns:
         Dict with results.
@@ -256,6 +265,27 @@ def train_transformer_targeted(
         f"params={current_params:,} | budget={param_budget:,} | lr={base_lr}"
     )
 
+    # Infinite shuffled data iterator
+    data_pos = n_train  # Start exhausted to trigger initial shuffle
+    shuffled_indices = torch.arange(n_train)
+
+    def next_batch() -> torch.Tensor:
+        """Get next batch from infinitely reshuffled training data."""
+        nonlocal data_pos, shuffled_indices
+        if data_pos + config.batch_size > n_train:
+            shuffled_indices = torch.randperm(n_train)
+            data_pos = 0
+        batch = train_tokens[shuffled_indices[data_pos : data_pos + config.batch_size]]
+        data_pos += config.batch_size
+        return batch
+
+    # Steps per epoch: if set, use that; otherwise, full pass over data
+    if config.steps_per_epoch > 0:
+        steps_per_epoch = config.steps_per_epoch
+    else:
+        # One full pass = n_train / (batch_size * grad_accum_steps) optimizer steps
+        steps_per_epoch = max(1, n_train // (config.batch_size * config.grad_accum_steps))
+
     def train_until_plateau() -> tuple[float, float]:
         """Train epochs until plateau. Returns (val_loss, perplexity)."""
         nonlocal global_step, epoch_counter
@@ -267,24 +297,20 @@ def train_transformer_targeted(
         ppl = float("inf")
 
         while epochs_trained < config.max_epochs - epoch_counter:
-            # Shuffle training data
-            perm = torch.randperm(n_train)
-            shuffled = train_tokens[perm]
-
             model.train()
             epoch_loss = 0.0
             epoch_tokens = 0
             optimizer.zero_grad()
 
             pbar = tqdm(
-                range(0, n_train, config.batch_size),
+                range(steps_per_epoch),
                 desc=f"[{tag_prefix}] Epoch {epoch_counter + 1}",
                 leave=False,
             )
 
             accum_count = 0
-            for i in pbar:
-                batch = shuffled[i : i + config.batch_size].to(device)
+            for step_in_epoch in pbar:
+                batch = next_batch().to(device)
                 if batch.shape[0] == 0:
                     continue
                 inputs = batch[:, :-1]
@@ -309,7 +335,6 @@ def train_transformer_targeted(
                     global_step += 1
                     accum_count = 0
 
-                    # Log training loss periodically
                     if global_step % 50 == 0:
                         writer.add_scalar(
                             f"{tag_prefix}/Loss/Train",
@@ -346,7 +371,7 @@ def train_transformer_targeted(
                 f"patience={epochs_without_improvement}/{config.patience}"
             )
 
-            # Require relative improvement of min_improvement to reset patience
+            # Require relative improvement to reset patience
             threshold = best_val_loss * (1.0 - config.min_improvement)
             if val_loss < threshold:
                 best_val_loss = val_loss
@@ -373,22 +398,41 @@ def train_transformer_targeted(
     # --- Expansion loop ---
     while epoch_counter < config.max_epochs:
         if dynamic:
-            scores = transformer_layer_similarity_scores(model)
-            layer_order = sorted(range(len(scores)), key=lambda i: scores[i])
+            # Find layers that can be doubled within budget
+            eligible = []
+            for li in range(config.n_layers):
+                if params_after_doubling_mlp(model, li) <= param_budget:
+                    eligible.append(li)
 
-            chosen_layer = None
-            for li in layer_order:
-                new_params = params_after_doubling_mlp(model, li)
-                if new_params <= param_budget:
-                    chosen_layer = li
-                    break
-
-            if chosen_layer is None:
+            if not eligible:
                 logger.info(
                     f"[{tag_prefix}] No MLP can be doubled within budget. "
                     f"params={current_params:,}, budget={param_budget:,}"
                 )
                 break
+
+            if layer_selection == "similarity":
+                scores = transformer_layer_similarity_scores(model)
+                # Pick eligible layer with lowest similarity
+                chosen_layer = min(eligible, key=lambda i: scores[i])
+
+                logger.info(
+                    f"[{tag_prefix}] Similarity scores: "
+                    + ", ".join(f"L{i}={s:.4f}" for i, s in enumerate(scores))
+                )
+                logger.info(
+                    f"[{tag_prefix}] Selected layer {chosen_layer} "
+                    f"(sim={scores[chosen_layer]:.4f}, "
+                    f"d_ff {model.d_ff_list[chosen_layer]}->{model.d_ff_list[chosen_layer]*2})"
+                )
+            else:
+                # Random selection among eligible layers
+                chosen_layer = random.choice(eligible)
+                logger.info(
+                    f"[{tag_prefix}] Randomly selected layer {chosen_layer} "
+                    f"(d_ff {model.d_ff_list[chosen_layer]}->{model.d_ff_list[chosen_layer]*2}) "
+                    f"from eligible: {eligible}"
+                )
 
             old_d_ff = model.d_ff_list[chosen_layer]
             new_d_ff = old_d_ff * 2
@@ -396,15 +440,6 @@ def train_transformer_targeted(
                 layer_idx=chosen_layer, old_width=old_d_ff, new_width=new_d_ff,
             )
             expansion_plan.append(step)
-
-            logger.info(
-                f"[{tag_prefix}] Similarity scores: "
-                + ", ".join(f"L{i}={s:.4f}" for i, s in enumerate(scores))
-            )
-            logger.info(
-                f"[{tag_prefix}] Selected layer {chosen_layer} "
-                f"(sim={scores[chosen_layer]:.4f}, d_ff {old_d_ff}->{new_d_ff})"
-            )
         else:
             if exp_idx >= len(expansion_plan):
                 break
@@ -534,13 +569,14 @@ def run_transformer_experiment(config: TransformerConfig, log_dir: str):
     for i, s in enumerate(expansion_plan):
         logger.info(f"  {i+1}: layer {s.layer_idx} d_ff {s.old_width}->{s.new_width}")
 
-    # --- 2. Net2Net replay ---
+    # --- 2. Net2Net (random layer selection) ---
     torch.manual_seed(config.seed)
+    random.seed(config.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(config.seed)
 
     logger.info(f"\n{'='*60}")
-    logger.info("Running: Net2Net Targeted (replay)")
+    logger.info("Running: Net2Net (random layer selection)")
     logger.info(f"{'='*60}")
 
     start = time.time()
@@ -551,7 +587,7 @@ def run_transformer_experiment(config: TransformerConfig, log_dir: str):
         config=config,
         writer=writer,
         tag_prefix="Net2Net",
-        expansion_plan=expansion_plan,
+        layer_selection="random",
     )
     n2n_results["elapsed_time"] = time.time() - start
     all_results["net2net"] = n2n_results
@@ -588,28 +624,44 @@ def run_transformer_experiment(config: TransformerConfig, log_dir: str):
 
     start = time.time()
 
-    # Train with patience using a simple loop
+    # Train with patience using same step-based epochs
     best_val_loss = float("inf")
     epochs_without_improvement = 0
     epoch_counter = 0
     global_step = 0
     n_train = len(train_tokens)
 
+    # Infinite shuffled data iterator for scratch
+    scratch_data_pos = n_train
+    scratch_indices = torch.arange(n_train)
+
+    def scratch_next_batch() -> torch.Tensor:
+        nonlocal scratch_data_pos, scratch_indices
+        if scratch_data_pos + config.batch_size > n_train:
+            scratch_indices = torch.randperm(n_train)
+            scratch_data_pos = 0
+        batch = train_tokens[scratch_indices[scratch_data_pos : scratch_data_pos + config.batch_size]]
+        scratch_data_pos += config.batch_size
+        return batch
+
+    if config.steps_per_epoch > 0:
+        scratch_steps_per_epoch = config.steps_per_epoch
+    else:
+        scratch_steps_per_epoch = max(1, n_train // (config.batch_size * config.grad_accum_steps))
+
     while epoch_counter < config.max_epochs:
-        perm = torch.randperm(n_train)
-        shuffled = train_tokens[perm]
         scratch_model.train()
         scratch_optimizer.zero_grad()
         accum_count = 0
 
         pbar = tqdm(
-            range(0, n_train, config.batch_size),
+            range(scratch_steps_per_epoch),
             desc=f"[Scratch] Epoch {epoch_counter+1}",
             leave=False,
         )
 
-        for i in pbar:
-            batch = shuffled[i : i + config.batch_size].to(config.device)
+        for step_in_epoch in pbar:
+            batch = scratch_next_batch().to(config.device)
             if batch.shape[0] == 0:
                 continue
             inputs = batch[:, :-1]
