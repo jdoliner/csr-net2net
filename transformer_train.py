@@ -219,7 +219,9 @@ def train_transformer_targeted(
         Dict with results.
     """
     device = config.device
+    criterion = nn.CrossEntropyLoss()
     param_budget = config.param_budget
+    base_params = config.base_params
     base_lr = config.lr
 
     # Initialize model
@@ -430,16 +432,17 @@ def train_transformer_targeted(
 
         current_params = sum(p.numel() for p in model.parameters())
 
-        # Reset LR to base
+        # Scale LR by sqrt(base_params / current_params)
+        current_lr = compute_scaled_lr(base_lr, base_params, current_params)
         for pg in optimizer.param_groups:
-            pg["lr"] = base_lr
+            pg["lr"] = current_lr
 
         val_loss_after, ppl_after = evaluate_lm(
             model, val_tokens, config.batch_size, device
         )
         logger.info(
             f"[{tag_prefix}] Post: val_loss={val_loss_after:.4f} ppl={ppl_after:.2f} "
-            f"| d_ff={model.d_ff_list} | params={current_params:,} | lr={base_lr}"
+            f"| d_ff={model.d_ff_list} | params={current_params:,} | lr={current_lr:.6f}"
         )
 
         writer.add_scalar(f"{tag_prefix}/Val_Loss_PreExpand", val_loss_before, global_step)
