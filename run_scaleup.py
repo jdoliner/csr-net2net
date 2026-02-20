@@ -30,6 +30,8 @@ from tqdm import tqdm
 from train import compute_scaled_lr
 from transformer_model import TransformerLM
 from transformer_ops import (
+    expand_transformer_attn_continuous,
+    expand_transformer_attn_net2net,
     expand_transformer_mlp_continuous,
     expand_transformer_mlp_net2net,
 )
@@ -48,6 +50,8 @@ class ScaleupConfig:
     n_layers: int = 6
     d_ff_init: int = 1024
     d_ff_max: int = 4096
+    head_dim_init: int = 64   # d_model // n_heads = 256 // 4
+    head_dim_max: int = 128   # Target expanded head dimension
     max_seq_len: int = 256
     dropout: float = 0.1
 
@@ -71,14 +75,15 @@ class ScaleupConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def make_model(config: ScaleupConfig, d_ff: int) -> TransformerLM:
-    """Create a TransformerLM with uniform d_ff across all layers."""
+def make_model(config: ScaleupConfig, d_ff: int, head_dim: int) -> TransformerLM:
+    """Create a TransformerLM with uniform d_ff and head_dim across all layers."""
     return TransformerLM(
         vocab_size=50257,
         d_model=config.d_model,
         n_heads=config.n_heads,
         n_layers=config.n_layers,
         d_ff_list=[d_ff] * config.n_layers,
+        head_dim_list=[head_dim] * config.n_layers,
         max_seq_len=config.max_seq_len,
         dropout=config.dropout,
     )
@@ -87,20 +92,20 @@ def make_model(config: ScaleupConfig, d_ff: int) -> TransformerLM:
 def expand_all_layers(
     model: TransformerLM,
     new_d_ff: int,
+    new_head_dim: int,
     optimizer: torch.optim.Optimizer,
     method: str,
 ) -> TransformerLM:
-    """Expand all MLP blocks from current d_ff to new_d_ff.
+    """Expand all MLP blocks and attention heads to target dimensions.
 
-    Each single-layer expansion doubles d_ff. If the target requires multiple
-    doublings (e.g., 1024 -> 4096 = 2 doublings), we repeat until all layers
-    reach the target.
+    Each single expansion doubles one dimension. Repeats until all layers
+    reach their targets for both d_ff and head_dim.
     """
+    # Expand MLP blocks
     while True:
         all_at_target = True
         for layer_idx in range(model.n_layers):
-            current_d_ff = model.d_ff_list[layer_idx]
-            if current_d_ff < new_d_ff:
+            if model.d_ff_list[layer_idx] < new_d_ff:
                 all_at_target = False
                 if method == "continuous":
                     model = expand_transformer_mlp_continuous(model, layer_idx, optimizer)
@@ -108,6 +113,20 @@ def expand_all_layers(
                     model = expand_transformer_mlp_net2net(model, layer_idx, optimizer)
         if all_at_target:
             break
+
+    # Expand attention heads
+    while True:
+        all_at_target = True
+        for layer_idx in range(model.n_layers):
+            if model.head_dim_list[layer_idx] < new_head_dim:
+                all_at_target = False
+                if method == "continuous":
+                    model = expand_transformer_attn_continuous(model, layer_idx, optimizer)
+                else:
+                    model = expand_transformer_attn_net2net(model, layer_idx, optimizer)
+        if all_at_target:
+            break
+
     return model
 
 
@@ -247,16 +266,20 @@ def run_protocol(
 
     if is_scratch:
         d_ff = config.d_ff_max
+        head_dim = config.head_dim_max
         tag = "Scratch"
     else:
         d_ff = config.d_ff_init
+        head_dim = config.head_dim_init
         tag = name
 
-    model = make_model(config, d_ff).to(device)
+    model = make_model(config, d_ff, head_dim).to(device)
     params = sum(p.numel() for p in model.parameters())
 
     # Sqrt-scaled LR based on model size
-    base_params = sum(p.numel() for p in make_model(config, config.d_ff_init).parameters())
+    base_params = sum(
+        p.numel() for p in make_model(config, config.d_ff_init, config.head_dim_init).parameters()
+    )
     lr = compute_scaled_lr(config.lr, base_params, params)
 
     optimizer = torch.optim.AdamW(
@@ -266,8 +289,8 @@ def run_protocol(
     data_iter = InfiniteDataIter(train_tokens, config.batch_size)
 
     logger.info(
-        f"[{tag}] Starting | d_ff={d_ff} | params={params:,} | lr={lr:.6f} | "
-        f"total_steps={config.total_steps}"
+        f"[{tag}] Starting | d_ff={d_ff} head_dim={head_dim} | "
+        f"params={params:,} | lr={lr:.6f} | total_steps={config.total_steps}"
     )
 
     start_time = time.time()
@@ -299,9 +322,13 @@ def run_protocol(
 
         # Expand all layers
         logger.info(
-            f"[{tag}] === EXPANDING all layers d_ff {config.d_ff_init} -> {config.d_ff_max} ==="
+            f"[{tag}] === EXPANDING all layers: "
+            f"d_ff {config.d_ff_init}->{config.d_ff_max}, "
+            f"head_dim {config.head_dim_init}->{config.head_dim_max} ==="
         )
-        model = expand_all_layers(model, config.d_ff_max, optimizer, method)
+        model = expand_all_layers(
+            model, config.d_ff_max, config.head_dim_max, optimizer, method
+        )
 
         new_params = sum(p.numel() for p in model.parameters())
 
@@ -352,6 +379,10 @@ def main():
     parser.add_argument("--n-layers", type=int, default=6)
     parser.add_argument("--d-ff-init", type=int, default=1024)
     parser.add_argument("--d-ff-max", type=int, default=4096)
+    parser.add_argument("--head-dim-init", type=int, default=64,
+                        help="Initial head dimension (default: d_model // n_heads = 64)")
+    parser.add_argument("--head-dim-max", type=int, default=128,
+                        help="Target expanded head dimension")
     parser.add_argument("--max-seq-len", type=int, default=256)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -386,6 +417,8 @@ def main():
         n_layers=args.n_layers,
         d_ff_init=args.d_ff_init,
         d_ff_max=args.d_ff_max,
+        head_dim_init=args.head_dim_init,
+        head_dim_max=args.head_dim_max,
         max_seq_len=args.max_seq_len,
         dropout=args.dropout,
         lr=args.lr,

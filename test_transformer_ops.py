@@ -15,8 +15,11 @@ import torch
 
 from transformer_model import TransformerLM
 from transformer_ops import (
+    expand_transformer_attn_continuous,
+    expand_transformer_attn_net2net,
     expand_transformer_mlp_continuous,
     expand_transformer_mlp_net2net,
+    params_after_doubling_attn,
     params_after_doubling_mlp,
     transformer_layer_similarity_scores,
 )
@@ -26,6 +29,7 @@ D_MODEL = 32
 N_HEADS = 2
 N_LAYERS = 3
 D_FF = 64
+HEAD_DIM = D_MODEL // N_HEADS  # 16
 MAX_SEQ_LEN = 16
 
 
@@ -251,5 +255,172 @@ class TestCSRExpansion:
             tiny_transformer, 1, optimizer
         )
 
+        assert torch.allclose(new_model.tok_emb.weight.data, old_tok)
+        assert torch.allclose(new_model.pos_emb.weight.data, old_pos)
+
+
+# --- Attention head expansion tests ---
+
+
+class TestAttnParamsAfterDoubling:
+    def test_increases_params(self, tiny_transformer):
+        current = sum(p.numel() for p in tiny_transformer.parameters())
+        for i in range(N_LAYERS):
+            new_p = params_after_doubling_attn(tiny_transformer, i)
+            assert new_p > current
+
+    def test_correct_increase(self, tiny_transformer):
+        """Doubling head_dim: QKV grows by 3*H*D*d_model + 3*H*D, proj by d_model*H*D."""
+        current = sum(p.numel() for p in tiny_transformer.parameters())
+        new_p = params_after_doubling_attn(tiny_transformer, 0)
+        H, D = N_HEADS, HEAD_DIM
+        expected_increase = 3 * H * D * D_MODEL + 3 * H * D + D_MODEL * H * D
+        assert new_p == current + expected_increase
+
+
+class TestAttnNet2NetExpansion:
+    def test_head_dim_doubled(self, tiny_transformer, device):
+        optimizer = torch.optim.AdamW(tiny_transformer.parameters(), lr=1e-3)
+        new_model = expand_transformer_attn_net2net(
+            tiny_transformer, 1, optimizer, noise_std=0.0
+        )
+        expected = [HEAD_DIM, HEAD_DIM * 2, HEAD_DIM]
+        assert new_model.head_dim_list == expected
+
+    def test_qkv_shape(self, tiny_transformer, device):
+        optimizer = torch.optim.AdamW(tiny_transformer.parameters(), lr=1e-3)
+        new_model = expand_transformer_attn_net2net(
+            tiny_transformer, 0, optimizer, noise_std=0.0
+        )
+        new_hd = HEAD_DIM * 2
+        assert new_model.blocks[0].attn.qkv.weight.shape == (3 * N_HEADS * new_hd, D_MODEL)
+        assert new_model.blocks[0].attn.proj.weight.shape == (D_MODEL, N_HEADS * new_hd)
+
+    def test_other_layers_unchanged(self, tiny_transformer, device):
+        optimizer = torch.optim.AdamW(tiny_transformer.parameters(), lr=1e-3)
+        old_qkv_0 = tiny_transformer.blocks[0].attn.qkv.weight.data.clone()
+        old_qkv_2 = tiny_transformer.blocks[2].attn.qkv.weight.data.clone()
+
+        new_model = expand_transformer_attn_net2net(
+            tiny_transformer, 1, optimizer, noise_std=0.0
+        )
+
+        assert torch.allclose(new_model.blocks[0].attn.qkv.weight.data, old_qkv_0)
+        assert torch.allclose(new_model.blocks[2].attn.qkv.weight.data, old_qkv_2)
+
+    def test_mlp_unchanged(self, tiny_transformer, device):
+        """MLP weights should be untouched by attention expansion."""
+        optimizer = torch.optim.AdamW(tiny_transformer.parameters(), lr=1e-3)
+        old_mlp_w = tiny_transformer.blocks[1].mlp.up.weight.data.clone()
+
+        new_model = expand_transformer_attn_net2net(
+            tiny_transformer, 1, optimizer, noise_std=0.0
+        )
+
+        assert torch.allclose(new_model.blocks[1].mlp.up.weight.data, old_mlp_w)
+
+    def test_forward_works(self, tiny_transformer, device):
+        optimizer = torch.optim.AdamW(tiny_transformer.parameters(), lr=1e-3)
+        new_model = expand_transformer_attn_net2net(
+            tiny_transformer, 0, optimizer, noise_std=0.0
+        )
+        x = torch.randint(0, VOCAB_SIZE, (2, 8), device=device)
+        out = new_model(x)
+        assert out.shape == (2, 8, VOCAB_SIZE)
+
+
+class TestAttnCSRExpansion:
+    def test_head_dim_doubled(self, tiny_transformer, device):
+        optimizer = torch.optim.AdamW(tiny_transformer.parameters(), lr=1e-3)
+        x = torch.randint(0, VOCAB_SIZE, (2, 8), device=device)
+        loss = tiny_transformer(x).sum()
+        loss.backward()
+        optimizer.step()
+
+        new_model = expand_transformer_attn_continuous(tiny_transformer, 2, optimizer)
+        expected = [HEAD_DIM, HEAD_DIM, HEAD_DIM * 2]
+        assert new_model.head_dim_list == expected
+
+    def test_weight_shapes(self, tiny_transformer, device):
+        optimizer = torch.optim.AdamW(tiny_transformer.parameters(), lr=1e-3)
+        x = torch.randint(0, VOCAB_SIZE, (2, 8), device=device)
+        loss = tiny_transformer(x).sum()
+        loss.backward()
+        optimizer.step()
+
+        new_model = expand_transformer_attn_continuous(tiny_transformer, 0, optimizer)
+        new_hd = HEAD_DIM * 2
+        assert new_model.blocks[0].attn.qkv.weight.shape == (3 * N_HEADS * new_hd, D_MODEL)
+        assert new_model.blocks[0].attn.qkv.bias.shape == (3 * N_HEADS * new_hd,)
+        assert new_model.blocks[0].attn.proj.weight.shape == (D_MODEL, N_HEADS * new_hd)
+        assert new_model.blocks[0].attn.proj.bias.shape == (D_MODEL,)
+        # Other layers unchanged
+        assert new_model.blocks[1].attn.qkv.weight.shape == (3 * N_HEADS * HEAD_DIM, D_MODEL)
+
+    def test_optimizer_state_shapes(self, tiny_transformer, device):
+        optimizer = torch.optim.AdamW(tiny_transformer.parameters(), lr=1e-3)
+        x = torch.randint(0, VOCAB_SIZE, (2, 8), device=device)
+        loss = tiny_transformer(x).sum()
+        loss.backward()
+        optimizer.step()
+
+        new_model = expand_transformer_attn_continuous(tiny_transformer, 1, optimizer)
+        for param in new_model.parameters():
+            if param in optimizer.state:
+                state = optimizer.state[param]
+                if "exp_avg" in state:
+                    assert state["exp_avg"].shape == param.shape
+                if "exp_avg_sq" in state:
+                    assert state["exp_avg_sq"].shape == param.shape
+
+    def test_can_train_after_expansion(self, tiny_transformer, device):
+        optimizer = torch.optim.AdamW(tiny_transformer.parameters(), lr=1e-3)
+        x = torch.randint(0, VOCAB_SIZE, (2, 8), device=device)
+        loss = tiny_transformer(x).sum()
+        loss.backward()
+        optimizer.step()
+
+        new_model = expand_transformer_attn_continuous(tiny_transformer, 0, optimizer)
+        for _ in range(3):
+            optimizer.zero_grad()
+            out = new_model(x)
+            loss = out.sum()
+            loss.backward()
+            optimizer.step()
+
+    def test_sequential_attn_and_mlp_expansion(self, tiny_transformer, device):
+        """Expand attention on layer 0, then MLP on layer 1, verify trainability."""
+        optimizer = torch.optim.AdamW(tiny_transformer.parameters(), lr=1e-3)
+        x = torch.randint(0, VOCAB_SIZE, (2, 8), device=device)
+        loss = tiny_transformer(x).sum()
+        loss.backward()
+        optimizer.step()
+
+        model = expand_transformer_attn_continuous(tiny_transformer, 0, optimizer)
+        assert model.head_dim_list == [HEAD_DIM * 2, HEAD_DIM, HEAD_DIM]
+        assert model.d_ff_list == [D_FF, D_FF, D_FF]
+
+        model = expand_transformer_mlp_continuous(model, 1, optimizer)
+        assert model.head_dim_list == [HEAD_DIM * 2, HEAD_DIM, HEAD_DIM]
+        assert model.d_ff_list == [D_FF, D_FF * 2, D_FF]
+
+        for _ in range(3):
+            optimizer.zero_grad()
+            out = model(x)
+            loss = out.sum()
+            loss.backward()
+            optimizer.step()
+
+    def test_embedding_preserved(self, tiny_transformer, device):
+        optimizer = torch.optim.AdamW(tiny_transformer.parameters(), lr=1e-3)
+        x = torch.randint(0, VOCAB_SIZE, (2, 8), device=device)
+        loss = tiny_transformer(x).sum()
+        loss.backward()
+        optimizer.step()
+
+        old_tok = tiny_transformer.tok_emb.weight.data.clone()
+        old_pos = tiny_transformer.pos_emb.weight.data.clone()
+
+        new_model = expand_transformer_attn_continuous(tiny_transformer, 1, optimizer)
         assert torch.allclose(new_model.tok_emb.weight.data, old_tok)
         assert torch.allclose(new_model.pos_emb.weight.data, old_pos)
